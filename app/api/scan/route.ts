@@ -66,40 +66,70 @@ async function logAgentThought(
 // ---------------------------------------------------------------------------
 // Helper: Fetch subdomains from crt.sh JSON API
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Helper: Fetch subdomains from crt.sh JSON API with Multi-Source Fallback
+// ---------------------------------------------------------------------------
 async function fetchSubdomainsFromCrtSh(domain: string): Promise<string[]> {
+    const subdomainsSet = new Set<string>();
+
+    // --- Source 1: Optimized crt.sh Query ---
     try {
         const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 7000); // 7s timeout limit
+        const timeout = setTimeout(() => controller.abort(), 6000); // 6s threshold
 
-        const response = await fetch(`https://crt.sh/?q=${domain}&output=json`, {
+        // Added &exclude=expired to drastically reduce DB query execution times
+        const response = await fetch(`https://crt.sh/?q=${domain}&output=json&exclude=expired`, {
             signal: controller.signal,
             headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) BountyWire/2.0'
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
             }
         });
         clearTimeout(timeout);
 
-        if (!response.ok) return [];
-
-        const data = await response.json() as Array<{ name_value: string }>;
-        const subdomainsSet = new Set<string>();
-
-        for (const item of data) {
-            // Clean wildcards, convert to lowercase, split multi-domain entries
-            const names = item.name_value.toLowerCase().split('\n');
-            for (let name of names) {
-                name = name.replace(/^\*\./, '').trim();
-                if (name && name.endsWith(domain) && name !== domain) {
-                    subdomainsSet.add(name);
+        if (response.ok) {
+            const data = await response.json() as Array<{ name_value: string }>;
+            for (const item of data) {
+                const names = item.name_value.toLowerCase().split('\n');
+                for (let name of names) {
+                    name = name.replace(/^\*\./, '').trim();
+                    if (name && name.endsWith(domain) && name !== domain) {
+                        subdomainsSet.add(name);
+                    }
                 }
             }
         }
-
-        return Array.from(subdomainsSet);
     } catch (err) {
-        console.error('[fetchSubdomainsFromCrtSh] Failed fetching logs:', err);
-        return [];
+        console.warn('[fetchSubdomainsFromCrtSh] crt.sh timed out or failed. Pivoting to Certspotter...');
     }
+
+    // --- Source 2: Certspotter API Fallback (High Reliability) ---
+    if (subdomainsSet.size === 0) {
+        try {
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), 5000);
+
+            const response = await fetch(`https://api.certspotter.com/v1/issuances?domain=${domain}&include_subdomains=true&expand=dns_names`, {
+                signal: controller.signal
+            });
+            clearTimeout(timeout);
+
+            if (response.ok) {
+                const data = await response.json() as Array<{ dns_names: string[] }>;
+                for (const item of data) {
+                    for (let name of item.dns_names) {
+                        name = name.toLowerCase().replace(/^\*\./, '').trim();
+                        if (name && name.endsWith(domain) && name !== domain) {
+                            subdomainsSet.add(name);
+                        }
+                    }
+                }
+            }
+        } catch (err) {
+            console.error('[fetchSubdomainsFromCrtSh] Certspotter fallback failed:', err);
+        }
+    }
+
+    return Array.from(subdomainsSet);
 }
 
 // ---------------------------------------------------------------------------
