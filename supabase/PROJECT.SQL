@@ -83,6 +83,12 @@ ON agent_logs FOR ALL TO service_role USING (true) WITH CHECK (true);
 CREATE POLICY IF NOT EXISTS "Allow service_role write on vulnerabilities"
 ON vulnerabilities FOR ALL TO service_role USING (true) WITH CHECK (true);
 
+ALTER PUBLICATION supabase_realtime ADD TABLE public.targets;
+ALTER PUBLICATION supabase_realtime ADD TABLE public.subdomains;
+ALTER PUBLICATION supabase_realtime ADD TABLE public.agent_logs;
+ALTER PUBLICATION supabase_realtime ADD TABLE public.vulnerabilities;
+
+
 -- =============================================================================
 -- REALTIME PUBLICATION
 -- Make sure these tables are included in the Supabase Realtime publication.
