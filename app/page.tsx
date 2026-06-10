@@ -75,7 +75,6 @@ export default function Dashboard() {
     setVulns([]);
 
     try {
-      // Replace your old fetch line with this:
       const response = await fetch('/api/scan', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -85,9 +84,13 @@ export default function Dashboard() {
       const data = await response.json();
       if (data.success) {
         setCurrentTargetId(data.target_id);
+      } else {
+        console.error("Scan failed:", data.error);
+        setScanning(false);
       }
     } catch (error) {
       console.error("Failed to start scan:", error);
+      setScanning(false);
     }
   };
 
