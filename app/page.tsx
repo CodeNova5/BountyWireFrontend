@@ -16,7 +16,7 @@ interface Log {
   step_name: string;
   log_level: string;
   message: string;
-  created_at: string;
+  timestamp: string;
 }
 
 interface Vulnerability {
@@ -69,7 +69,7 @@ export default function Dashboard() {
         .from('agent_logs')
         .select('*')
         .eq('target_id', target.id)
-        .order('created_at', { ascending: true }),
+        .order('timestamp', { ascending: true }),
       supabase
         .from('vulnerabilities')
         .select('*')
@@ -304,7 +304,7 @@ export default function Dashboard() {
                         <span>[{log.step_name.toUpperCase()}]</span>
                         <span className="flex items-center gap-1 opacity-60">
                           <Clock className="w-3 h-3" />
-                          {new Date(log.created_at).toLocaleTimeString()}
+                          {new Date(log.timestamp).toLocaleTimeString()}
                         </span>
                       </div>
                       <p className="leading-relaxed break-words">{log.message}</p>
