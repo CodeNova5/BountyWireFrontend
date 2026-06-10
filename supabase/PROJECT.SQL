@@ -55,32 +55,32 @@ ALTER TABLE vulnerabilities ENABLE ROW LEVEL SECURITY;
 -- ---------------------------------------------------------------------------
 -- READ policies — allow the anon key (frontend) to read all rows
 -- ---------------------------------------------------------------------------
-CREATE POLICY IF NOT EXISTS "Allow public read on targets"
+CREATE POLICY "Allow public read on targets"
 ON targets FOR SELECT TO anon USING (true);
 
-CREATE POLICY IF NOT EXISTS "Allow public read on subdomains"
+CREATE POLICY "Allow public read on subdomains"
 ON subdomains FOR SELECT TO anon USING (true);
 
-CREATE POLICY IF NOT EXISTS "Allow public read on agent_logs"
+CREATE POLICY "Allow public read on agent_logs"
 ON agent_logs FOR SELECT TO anon USING (true);
 
-CREATE POLICY IF NOT EXISTS "Allow public read on vulnerabilities"
+CREATE POLICY "Allow public read on vulnerabilities"
 ON vulnerabilities FOR SELECT TO anon USING (true);
 
 -- ---------------------------------------------------------------------------
 -- WRITE policies — allow the service_role (backend) to insert and update rows
 -- The service_role bypasses RLS by default, but these are explicit for clarity.
 -- ---------------------------------------------------------------------------
-CREATE POLICY IF NOT EXISTS "Allow service_role write on targets"
+CREATE POLICY "Allow service_role write on targets"
 ON targets FOR ALL TO service_role USING (true) WITH CHECK (true);
 
-CREATE POLICY IF NOT EXISTS "Allow service_role write on subdomains"
+CREATE POLICY "Allow service_role write on subdomains"
 ON subdomains FOR ALL TO service_role USING (true) WITH CHECK (true);
 
-CREATE POLICY IF NOT EXISTS "Allow service_role write on agent_logs"
+CREATE POLICY "Allow service_role write on agent_logs"
 ON agent_logs FOR ALL TO service_role USING (true) WITH CHECK (true);
 
-CREATE POLICY IF NOT EXISTS "Allow service_role write on vulnerabilities"
+CREATE POLICY "Allow service_role write on vulnerabilities"
 ON vulnerabilities FOR ALL TO service_role USING (true) WITH CHECK (true);
 
 ALTER PUBLICATION supabase_realtime ADD TABLE public.targets;

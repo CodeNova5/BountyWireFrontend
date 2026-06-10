@@ -64,6 +64,45 @@ async function logAgentThought(
 }
 
 // ---------------------------------------------------------------------------
+// Helper: Fetch subdomains from crt.sh JSON API
+// ---------------------------------------------------------------------------
+async function fetchSubdomainsFromCrtSh(domain: string): Promise<string[]> {
+    try {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 7000); // 7s timeout limit
+
+        const response = await fetch(`https://crt.sh/?q=${domain}&output=json`, {
+            signal: controller.signal,
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) BountyWire/2.0'
+            }
+        });
+        clearTimeout(timeout);
+
+        if (!response.ok) return [];
+
+        const data = await response.json() as Array<{ name_value: string }>;
+        const subdomainsSet = new Set<string>();
+
+        for (const item of data) {
+            // Clean wildcards, convert to lowercase, split multi-domain entries
+            const names = item.name_value.toLowerCase().split('\n');
+            for (let name of names) {
+                name = name.replace(/^\*\./, '').trim();
+                if (name && name.endsWith(domain) && name !== domain) {
+                    subdomainsSet.add(name);
+                }
+            }
+        }
+
+        return Array.from(subdomainsSet);
+    } catch (err) {
+        console.error('[fetchSubdomainsFromCrtSh] Failed fetching logs:', err);
+        return [];
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Helper: probe a single subdomain (CNAME → A-record → HTTP status)
 // ---------------------------------------------------------------------------
 async function probeSubdomain(subdomain: string): Promise<SubdomainResult> {
@@ -106,7 +145,6 @@ async function probeSubdomain(subdomain: string): Promise<SubdomainResult> {
         result.httpStatus = response.status;
     } catch (fetchErr: unknown) {
         const msg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
-        // Not a fatal error — many subdomains are HTTPS-only or firewalled
         result.httpStatus = null;
         result.error = `HTTP probe failed: ${msg}`;
     }
@@ -287,19 +325,43 @@ export async function POST(request: Request) {
         await logAgentThought(
             targetId,
             'Initialization',
-            `BountyWire Agent v2 initialized. Target domain: ${domain}. Beginning active DNS reconnaissance.`
+            `BountyWire Agent v2 initialized. Target domain: ${domain}. Beginning passive CT log discovery.`
         );
 
         // -----------------------------------------------------------------------
-        // Step 1: Define target subdomains for active enumeration
+        // Step 1: Active Passive Enumeration via crt.sh
         // -----------------------------------------------------------------------
-        const prefixes = ['dev', 'marketing', 'status', 'shop', 'blog', 'api', 'staging', 'admin'];
-        const subdomainsToProbe = prefixes.map((p) => `${p}.${domain}`);
+        await logAgentThought(
+            targetId,
+            'Enumeration',
+            `Querying crt.sh database for valid Certificate Transparency records linked to ${domain}...`
+        );
+
+        let subdomainsToProbe = await fetchSubdomainsFromCrtSh(domain);
+
+        // Fallback to static common array if crt.sh returns nothing or fails
+        if (subdomainsToProbe.length === 0) {
+            const staticPrefixes = ['dev', 'marketing', 'status', 'shop', 'blog', 'api', 'staging', 'admin'];
+            subdomainsToProbe = staticPrefixes.map((p) => `${p}.${domain}`);
+            await logAgentThought(
+                targetId,
+                'Enumeration',
+                `Passive discovery returned 0 records (or timed out). Falling back to static seed array.`,
+                'warning'
+            );
+        }
+
+        // Circuit breaker: Cap scanning at 40 elements to fit safely inside Vercel's 5-minute timeout window
+        const maxScanCap = 40;
+        const targetTruncated = subdomainsToProbe.length > maxScanCap;
+        if (targetTruncated) {
+            subdomainsToProbe = subdomainsToProbe.slice(0, maxScanCap);
+        }
 
         await logAgentThought(
             targetId,
             'Enumeration',
-            `Queuing ${subdomainsToProbe.length} subdomains for active DNS probing: ${subdomainsToProbe.join(', ')}`
+            `Discovered and queued ${subdomainsToProbe.length} unique assets for verification loop.${targetTruncated ? ' (Truncated to fit platform time limit)' : ''}`
         );
 
         // -----------------------------------------------------------------------
@@ -311,7 +373,7 @@ export async function POST(request: Request) {
             await logAgentThought(
                 targetId,
                 'DNS Probe',
-                `Resolving ${subdomain} — attempting CNAME lookup, then A-record fallback...`
+                `Resolving ${subdomain} — checking maps and endpoints...`
             );
 
             const probe = await probeSubdomain(subdomain);
@@ -321,7 +383,7 @@ export async function POST(request: Request) {
                 await logAgentThought(
                     targetId,
                     'DNS Probe',
-                    `${subdomain} → No DNS records found. Skipping. (${probe.error})`,
+                    `${subdomain} → Resolution skipped. Host offline or absent.`,
                     'info'
                 );
                 continue;
@@ -333,7 +395,7 @@ export async function POST(request: Request) {
             await logAgentThought(
                 targetId,
                 'DNS Probe',
-                `${subdomain} resolved: ${cnameInfo} | ${httpInfo}${probe.error ? ` | Note: ${probe.error}` : ''}`
+                `${subdomain} resolved: ${cnameInfo} | ${httpInfo}`
             );
 
             // Insert subdomain record
@@ -346,7 +408,7 @@ export async function POST(request: Request) {
                     live_status: probe.httpStatus && probe.httpStatus < 500 ? 'live' : 'unknown',
                 });
             } catch {
-                // Non-fatal — subdomain logging should never abort the scan
+                // Non-fatal
             }
         }
 
@@ -362,10 +424,8 @@ export async function POST(request: Request) {
         let vulnerabilitiesFound = 0;
 
         for (const probe of probeResults) {
-            // Skip subdomains with no DNS data at all
             if (!probe.cname && probe.ipAddresses.length === 0) continue;
 
-            // Only send to AI if: has a cloud-provider CNAME AND (HTTP 404 or unreachable)
             const isCloudCname = probe.cname ? matchesCloudProvider(probe.cname) : null;
             const isSuspectStatus =
                 probe.httpStatus === null || probe.httpStatus === 404 || probe.httpStatus === 410;
@@ -382,11 +442,10 @@ export async function POST(request: Request) {
             await logAgentThought(
                 targetId,
                 'Analysis Loop',
-                `⚠ Suspicious pattern detected on ${probe.subdomain}: CNAME points to ${probe.cname} (cloud provider) with HTTP ${probe.httpStatus ?? 'unreachable'}. Escalating to AI analysis...`,
+                `⚠ Suspicious pattern detected on ${probe.subdomain}: CNAME points to ${probe.cname} with HTTP ${probe.httpStatus ?? 'unreachable'}. Escalating to AI...`,
                 'warning'
             );
 
-            // --- First AI call: classify vulnerability ---
             const analysis = await analyzeForTakeover(probe);
 
             if (!analysis) {
@@ -402,14 +461,13 @@ export async function POST(request: Request) {
             await logAgentThought(
                 targetId,
                 'Takeover Verification',
-                `AI verdict for ${probe.subdomain}: is_vulnerable=${analysis.is_vulnerable}, confidence=${analysis.confidence}. Reasoning: ${analysis.reasoning}`,
+                `AI verdict for ${probe.subdomain}: is_vulnerable=${analysis.is_vulnerable}. Reasoning: ${analysis.reasoning}`,
                 analysis.is_vulnerable ? 'warning' : 'info'
             );
 
             if (analysis.is_vulnerable) {
                 vulnerabilitiesFound++;
 
-                // Fetch subdomain DB record id for FK
                 const { data: subRow } = await supabase
                     .from('subdomains')
                     .select('id')
@@ -417,7 +475,6 @@ export async function POST(request: Request) {
                     .eq('subdomain', probe.subdomain)
                     .maybeSingle();
 
-                // --- Second AI call: generate remediation report ---
                 await logAgentThought(
                     targetId,
                     'Report Generation',
@@ -426,13 +483,6 @@ export async function POST(request: Request) {
 
                 const remediationReport = await generateRemediationReport(probe, analysis);
 
-                await logAgentThought(
-                    targetId,
-                    'Report Generation',
-                    `Remediation report generated (${remediationReport.length} chars). Saving to vulnerabilities table...`
-                );
-
-                // Save vulnerability with full Markdown report in evidence column
                 await supabase.from('vulnerabilities').insert({
                     target_id: targetId,
                     subdomain_id: subRow?.id ?? null,
@@ -444,7 +494,7 @@ export async function POST(request: Request) {
                 await logAgentThought(
                     targetId,
                     'Takeover Verification',
-                    `🚨 VULNERABILITY CONFIRMED on ${probe.subdomain} [${analysis.confidence} confidence]. Dangling CNAME: ${probe.cname}. Full remediation report saved.`,
+                    `🚨 VULNERABILITY CONFIRMED on ${probe.subdomain}. Full remediation report saved.`,
                     'critical'
                 );
             }
