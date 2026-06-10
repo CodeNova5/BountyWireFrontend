@@ -75,7 +75,8 @@ export default function Dashboard() {
     setVulns([]);
 
     try {
-      const response = await fetch(`${process.env.NEXT_PUBLIC_BACKEND_URL}/api/scan`, {
+      // Replace your old fetch line with this:
+      const response = await fetch('/api/scan', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ domain }),
@@ -146,9 +147,9 @@ export default function Dashboard() {
               <div
                 key={log.id}
                 className={`p-3 rounded border ${log.log_level === 'warning' ? 'bg-amber-950/20 border-amber-500/20 text-amber-300' :
-                    log.log_level === 'critical' ? 'bg-rose-950/20 border-rose-500/20 text-rose-300' :
-                      log.step_name === 'Completed' ? 'bg-emerald-950/20 border-emerald-500/20 text-emerald-400' :
-                        'bg-slate-950 border-slate-800 text-slate-400'
+                  log.log_level === 'critical' ? 'bg-rose-950/20 border-rose-500/20 text-rose-300' :
+                    log.step_name === 'Completed' ? 'bg-emerald-950/20 border-emerald-500/20 text-emerald-400' :
+                      'bg-slate-950 border-slate-800 text-slate-400'
                   }`}
               >
                 <div className="flex justify-between font-bold mb-1">
