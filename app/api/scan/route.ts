@@ -4,6 +4,9 @@ import OpenAI from 'openai';
 import { z } from 'zod';
 import dns from 'dns';
 
+// Force Node.js runtime — required for dns module and long-running scans
+export const runtime = 'nodejs';
+
 // Vercel max execution time — 5 minutes
 export const maxDuration = 300;
 

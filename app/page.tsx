@@ -104,44 +104,41 @@ function ThreatGauge({ vulnerabilityCount, isScanning }: { vulnerabilityCount: n
 // ---------------------------------------------------------------------------
 // Animated Progress Bar
 // ---------------------------------------------------------------------------
+function GlobalStyles() {
+  return (
+    <style dangerouslySetInnerHTML={{ __html: `
+      @keyframes shimmer {
+        0% { transform: translateX(-100%); }
+        100% { transform: translateX(400%); }
+      }
+      @keyframes float {
+        0%, 100% { transform: translateY(0px); }
+        50% { transform: translateY(-8px); }
+      }
+      @keyframes pulse-glow {
+        0%, 100% { filter: drop-shadow(0 0 20px rgba(6, 182, 212, 0.3)); }
+        50% { filter: drop-shadow(0 0 40px rgba(6, 182, 212, 0.6)); }
+      }
+      ::-webkit-scrollbar { width: 6px; }
+      ::-webkit-scrollbar-track { background: transparent; }
+      ::-webkit-scrollbar-thumb { background: rgba(71, 85, 105, 0.5); border-radius: 3px; }
+      ::-webkit-scrollbar-thumb:hover { background: rgba(71, 85, 105, 0.7); }
+    ` }} />
+  );
+}
+
 function GlobalProgressBar({ isScanning }: { isScanning: boolean }) {
   if (!isScanning) return null;
 
   return (
     <div className="absolute top-0 left-0 right-0 h-1 bg-slate-800 overflow-hidden z-20">
       <div
-        className="h-full bg-gradient-to-r from-cyan-500 via-violet-500 to-cyan-500 animate-shimmer"
+        className="h-full bg-gradient-to-r from-cyan-500 via-violet-500 to-cyan-500"
         style={{
           width: '30%',
           animation: 'shimmer 1.5s ease-in-out infinite',
         }}
       />
-      <style jsx global>{`
-        @keyframes shimmer {
-          0% {
-            transform: translateX(-100%);
-          }
-          100% {
-            transform: translateX(400%);
-          }
-        }
-        @keyframes float {
-          0%, 100% {
-            transform: translateY(0px);
-          }
-          50% {
-            transform: translateY(-8px);
-          }
-        }
-        @keyframes pulse-glow {
-          0%, 100% {
-            box-shadow: 0 0 20px rgba(6, 182, 212, 0.3);
-          }
-          50% {
-            box-shadow: 0 0 40px rgba(6, 182, 212, 0.6);
-          }
-        }
-      `}</style>
     </div>
   );
 }
@@ -457,6 +454,7 @@ export default function SecurityDashboard() {
 
   return (
     <>
+      <GlobalStyles />
       <GlobalProgressBar isScanning={isScanning} />
 
       <div className="relative w-full h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950 overflow-hidden">
@@ -769,34 +767,7 @@ export default function SecurityDashboard() {
         </div>
       </div>
 
-      <style jsx global>{`
-        @keyframes pulse-glow {
-          0%,
-          100% {
-            filter: drop-shadow(0 0 20px rgba(6, 182, 212, 0.3));
-          }
-          50% {
-            filter: drop-shadow(0 0 40px rgba(6, 182, 212, 0.6));
-          }
-        }
 
-        ::-webkit-scrollbar {
-          width: 6px;
-        }
-
-        ::-webkit-scrollbar-track {
-          background: transparent;
-        }
-
-        ::-webkit-scrollbar-thumb {
-          background: rgba(71, 85, 105, 0.5);
-          border-radius: 3px;
-        }
-
-        ::-webkit-scrollbar-thumb:hover {
-          background: rgba(71, 85, 105, 0.7);
-        }
-      `}</style>
     </>
   );
 }
