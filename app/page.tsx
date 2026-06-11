@@ -341,7 +341,7 @@ export default function SecurityDashboard() {
 
   const fetchLogs = useCallback(async (targetId: string) => {
     try {
-      const { data } = await supabase.from('logs').select('*').eq('target_id', targetId).order('timestamp', { ascending: true });
+      const { data } = await supabase.from('agent_logs').select('*').eq('target_id', targetId).order('timestamp', { ascending: true });
       setLogs(data as Log[]);
     } catch (error) {
       console.error('Error fetching logs:', error);
@@ -368,8 +368,8 @@ export default function SecurityDashboard() {
 
   const subscribeToUpdates = (targetId: string) => {
     const logsChannel = supabase
-      .channel(`logs:${targetId}`)
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'logs', filter: `target_id=eq.${targetId}` }, (payload) => {
+      .channel(`agent_logs:${targetId}`)
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'agent_logs', filter: `target_id=eq.${targetId}` }, (payload) => {
         setLogs((prev) => [...prev, payload.new as Log]);
       })
       .subscribe();
@@ -392,8 +392,9 @@ export default function SecurityDashboard() {
       .channel(`targets:${targetId}`)
       .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'targets', filter: `id=eq.${targetId}` }, (payload) => {
         const updatedTarget = payload.new as Target;
-        if (updatedTarget.status === 'complete') {
+        if (updatedTarget.status === 'completed') {
           setIsScanning(false);
+          fetchTargets();
         }
       })
       .subscribe();
@@ -522,34 +523,74 @@ export default function SecurityDashboard() {
             </div>
           </div>
 
-          {/* Main Content */}
-          {activeTarget ? (
-            <main className="flex-1 overflow-hidden flex">
-              {/* Left Panel - Scan History Sidebar */}
-              <div className="w-64 border-r border-slate-800/50 bg-slate-900/30 backdrop-blur-sm overflow-y-auto">
-                <div className="p-4 border-b border-slate-800/50">
-                  <h3 className="text-xs font-bold text-slate-400 uppercase tracking-widest mb-3">Scan History</h3>
-                  <div className="space-y-2">
-                    {targets.map((target) => (
+          {/* Main Content — always show sidebar */}
+          <main className="flex-1 overflow-hidden flex">
+            {/* Left Panel - Scan History Sidebar (always visible) */}
+            <div className="w-64 border-r border-slate-800/50 bg-slate-900/30 backdrop-blur-sm flex flex-col">
+              <div className="p-4 border-b border-slate-800/50 shrink-0">
+                <div className="flex items-center gap-2 mb-3">
+                  <Clock className="w-3.5 h-3.5 text-slate-500" />
+                  <h3 className="text-xs font-bold text-slate-400 uppercase tracking-widest">Scan History</h3>
+                  {targets.length > 0 && (
+                    <span className="ml-auto text-[10px] bg-slate-700/50 text-slate-400 px-2 py-0.5 rounded-full font-mono">
+                      {targets.length}
+                    </span>
+                  )}
+                </div>
+              </div>
+              <div className="flex-1 overflow-y-auto p-3 space-y-1.5">
+                {targets.length === 0 ? (
+                  <div className="flex flex-col items-center justify-center h-32 text-slate-600 gap-2">
+                    <Radar className="w-8 h-8 opacity-30" />
+                    <p className="text-[11px] text-center">No scans yet</p>
+                  </div>
+                ) : (
+                  targets.map((target) => {
+                    const isActive = activeTarget?.id === target.id;
+                    const isCompleted = target.status === 'completed';
+                    const isFailed = target.status === 'failed';
+                    const isRunning = target.status === 'scanning';
+                    return (
                       <button
                         key={target.id}
                         onClick={() => handleTargetSelect(target)}
-                        className={`w-full text-left px-3 py-2.5 rounded-lg transition-all text-sm font-medium ${activeTarget.id === target.id
-                            ? 'bg-gradient-to-r from-cyan-500/30 to-violet-500/30 border border-cyan-500/50 text-cyan-300'
-                            : 'text-slate-400 hover:bg-slate-800/50 border border-slate-800/30'
-                          }`}
+                        className={`w-full text-left px-3 py-2.5 rounded-xl transition-all ${
+                          isActive
+                            ? 'bg-gradient-to-r from-cyan-500/20 to-violet-500/20 border border-cyan-500/40 text-cyan-300'
+                            : 'text-slate-400 hover:bg-slate-800/50 border border-transparent hover:border-slate-700/50'
+                        }`}
                       >
-                        <div className="truncate">{target.domain}</div>
-                        <div className="text-[10px] text-slate-600 mt-0.5">{new Date(target.created_at).toLocaleDateString()}</div>
+                        <div className="flex items-center gap-1.5 mb-1">
+                          <div className={`w-1.5 h-1.5 rounded-full shrink-0 ${
+                            isRunning ? 'bg-amber-400 animate-pulse' :
+                            isCompleted ? 'bg-emerald-400' :
+                            isFailed ? 'bg-rose-400' : 'bg-slate-500'
+                          }`} />
+                          <span className="text-[11px] font-mono font-semibold truncate">{target.domain}</span>
+                        </div>
+                        <div className="flex items-center gap-1.5 pl-3">
+                          <span className={`text-[9px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded ${
+                            isRunning ? 'bg-amber-500/20 text-amber-400' :
+                            isCompleted ? 'bg-emerald-500/20 text-emerald-400' :
+                            isFailed ? 'bg-rose-500/20 text-rose-400' : 'bg-slate-700/50 text-slate-500'
+                          }`}>
+                            {target.status}
+                          </span>
+                          <span className="text-[9px] text-slate-600 ml-auto">
+                            {new Date(target.created_at).toLocaleDateString()}
+                          </span>
+                        </div>
                       </button>
-                    ))}
-                  </div>
-                </div>
+                    );
+                  })
+                )}
               </div>
+            </div>
 
-              {/* Right Panel - Dashboard Grid */}
-              <div className="flex-1 overflow-hidden flex flex-col">
-                <div className="grid grid-cols-12 gap-4 flex-1 overflow-hidden p-6">
+            {/* Right Panel */}
+            <div className="flex-1 overflow-hidden flex flex-col">
+          {activeTarget ? (
+              <div className="grid grid-cols-12 gap-4 flex-1 overflow-hidden p-6">
                   {/* Left - Threat Gauge & Logs */}
                   <div className="col-span-3 flex flex-col gap-4 min-h-0">
                     {/* Threat Gauge Card */}
@@ -700,24 +741,24 @@ export default function SecurityDashboard() {
                     </div>
                   </div>
                 </div>
-              </div>
-            </main>
-          ) : (
-            <div className="flex-1 flex items-center justify-center">
-              <div className="text-center">
-                <div className="mb-6 flex justify-center">
-                  <div className="relative">
-                    <div className="absolute inset-0 bg-gradient-to-r from-cyan-500 to-violet-500 rounded-3xl blur-2xl opacity-30 animate-pulse" />
-                    <div className="relative p-4 bg-gradient-to-br from-slate-800 to-slate-900 rounded-3xl border border-slate-700">
-                      <Radar className="w-16 h-16 text-gradient animate-pulse" style={{ animation: 'pulse-glow 2s ease-in-out infinite' }} />
+            ) : (
+              <div className="flex-1 flex items-center justify-center">
+                <div className="text-center">
+                  <div className="mb-6 flex justify-center">
+                    <div className="relative">
+                      <div className="absolute inset-0 bg-gradient-to-r from-cyan-500 to-violet-500 rounded-3xl blur-2xl opacity-30 animate-pulse" />
+                      <div className="relative p-4 bg-gradient-to-br from-slate-800 to-slate-900 rounded-3xl border border-slate-700">
+                        <Radar className="w-16 h-16 text-cyan-400 animate-pulse" style={{ animation: 'pulse-glow 2s ease-in-out infinite' }} />
+                      </div>
                     </div>
                   </div>
+                  <h2 className="text-2xl font-bold text-slate-200 mb-2">Ready to scan</h2>
+                  <p className="text-slate-400 text-sm">Enter a domain above and launch a scan to discover vulnerabilities</p>
                 </div>
-                <h2 className="text-2xl font-bold text-slate-200 mb-2">Ready to scan</h2>
-                <p className="text-slate-400 text-sm">Enter a domain above and launch a scan to discover vulnerabilities</p>
               </div>
+            )}
             </div>
-          )}
+          </main>
 
           {/* Report Modal */}
           {selectedReport && (
