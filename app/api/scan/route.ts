@@ -4,21 +4,25 @@ import OpenAI from 'openai';
 import { z } from 'zod';
 import dns from 'dns';
 
-// 1. Vercel max execution time — 5 minutes
+// Vercel max execution time — 5 minutes
 export const maxDuration = 300;
 
 // ---------------------------------------------------------------------------
-// Client initialization
+// Client initialization (lazy to avoid build-time evaluation)
 // ---------------------------------------------------------------------------
-const supabase = createClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.SUPABASE_SERVICE_ROLE_KEY!
-);
+function getSupabase() {
+    return createClient(
+        process.env.NEXT_PUBLIC_SUPABASE_URL!,
+        process.env.SUPABASE_SERVICE_ROLE_KEY!
+    );
+}
 
-const aiClient = new OpenAI({
-    baseURL: 'https://api.groq.com/openai/v1',
-    apiKey: process.env.GROQ_API_KEY!,
-});
+function getAiClient() {
+    return new OpenAI({
+        baseURL: 'https://api.groq.com/openai/v1',
+        apiKey: process.env.GROQ_API_KEY!,
+    });
+}
 
 // ---------------------------------------------------------------------------
 // Zod schema — enforces strict structured output from the AI
@@ -43,6 +47,16 @@ interface SubdomainResult {
     error: string | null;
 }
 
+interface AgentContext {
+    targetId: string;
+    domain: string;
+    discoveredSubdomains: string[];
+    probedSubdomains: Map<string, SubdomainResult>;
+    analyzedSubdomains: Set<string>;
+    vulnerabilities: Array<{ subdomain: string; analysis: TakeoverAnalysis; probe: SubdomainResult }>;
+    currentFocus: string | null;
+}
+
 // ---------------------------------------------------------------------------
 // Helper: write an agent thought to Supabase Realtime
 // ---------------------------------------------------------------------------
@@ -52,7 +66,7 @@ async function logAgentThought(
     message: string,
     logLevel: 'info' | 'warning' | 'critical' = 'info'
 ): Promise<void> {
-    const { error } = await supabase.from('agent_logs').insert({
+    const { error } = await getSupabase().from('agent_logs').insert({
         target_id: targetId,
         step_name: stepName,
         log_level: logLevel,
@@ -64,20 +78,37 @@ async function logAgentThought(
 }
 
 // ---------------------------------------------------------------------------
-// Helper: Fetch subdomains from crt.sh JSON API
+// Helper: log agent reasoning (thought process)
 // ---------------------------------------------------------------------------
+async function logAgentReasoning(targetId: string, thought: string): Promise<void> {
+    await logAgentThought(targetId, 'Agent Reasoning', thought, 'info');
+}
+
+// ---------------------------------------------------------------------------
+// Helper: log tool call
+// ---------------------------------------------------------------------------
+async function logToolCall(targetId: string, toolName: string, args: string, result: string): Promise<void> {
+    await logAgentThought(targetId, 'Tool Execution', `TOOLS.${toolName}(${args}) => ${result}`, 'info');
+}
+
+// ---------------------------------------------------------------------------
+// Helper: log tool result
+// ---------------------------------------------------------------------------
+async function logToolResult(targetId: string, result: string): Promise<void> {
+    await logAgentThought(targetId, 'Tool Result', result, 'info');
+}
+
 // ---------------------------------------------------------------------------
 // Helper: Fetch subdomains from crt.sh JSON API with Multi-Source Fallback
 // ---------------------------------------------------------------------------
 async function fetchSubdomainsFromCrtSh(domain: string): Promise<string[]> {
     const subdomainsSet = new Set<string>();
 
-    // --- Source 1: Optimized crt.sh Query ---
+    // Source 1: Optimized crt.sh Query
     try {
         const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 6000); // 6s threshold
+        const timeout = setTimeout(() => controller.abort(), 6000);
 
-        // Added &exclude=expired to drastically reduce DB query execution times
         const response = await fetch(`https://crt.sh/?q=${domain}&output=json&exclude=expired`, {
             signal: controller.signal,
             headers: {
@@ -102,7 +133,7 @@ async function fetchSubdomainsFromCrtSh(domain: string): Promise<string[]> {
         console.warn('[fetchSubdomainsFromCrtSh] crt.sh timed out or failed. Pivoting to Certspotter...');
     }
 
-    // --- Source 2: Certspotter API Fallback (High Reliability) ---
+    // Source 2: Certspotter API Fallback
     if (subdomainsSet.size === 0) {
         try {
             const controller = new AbortController();
@@ -133,57 +164,7 @@ async function fetchSubdomainsFromCrtSh(domain: string): Promise<string[]> {
 }
 
 // ---------------------------------------------------------------------------
-// Helper: probe a single subdomain (CNAME → A-record → HTTP status)
-// ---------------------------------------------------------------------------
-async function probeSubdomain(subdomain: string): Promise<SubdomainResult> {
-    const result: SubdomainResult = {
-        subdomain,
-        cname: null,
-        ipAddresses: [],
-        httpStatus: null,
-        error: null,
-    };
-
-    // --- CNAME lookup ---
-    try {
-        const cnameRecords = await dns.promises.resolveCname(subdomain);
-        result.cname = cnameRecords[0] ?? null;
-    } catch {
-        // CNAME not found — fall through to A-record
-    }
-
-    // --- A-record fallback ---
-    if (!result.cname) {
-        try {
-            result.ipAddresses = await dns.promises.resolve4(subdomain);
-        } catch {
-            result.error = 'No DNS record found (CNAME or A)';
-            return result; // Nothing resolves — skip HTTP check
-        }
-    }
-
-    // --- HTTP status probe ---
-    try {
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 5000);
-        const response = await fetch(`http://${subdomain}`, {
-            method: 'GET',
-            signal: controller.signal,
-            redirect: 'follow',
-        });
-        clearTimeout(timeout);
-        result.httpStatus = response.status;
-    } catch (fetchErr: unknown) {
-        const msg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
-        result.httpStatus = null;
-        result.error = `HTTP probe failed: ${msg}`;
-    }
-
-    return result;
-}
-
-// ---------------------------------------------------------------------------
-// Helper: check if a CNAME points to a known cloud provider (takeover surface)
+// Cloud provider patterns for takeover detection
 // ---------------------------------------------------------------------------
 const CLOUD_TAKEOVER_PATTERNS: RegExp[] = [
     /\.wordpress\.com$/i,
@@ -221,18 +202,364 @@ function matchesCloudProvider(cname: string): string | null {
 }
 
 // ---------------------------------------------------------------------------
-// Helper: first AI call — classify vulnerability
+// TOOL DEFINITIONS — OpenAI Function Calling Format
 // ---------------------------------------------------------------------------
-async function analyzeForTakeover(probe: SubdomainResult): Promise<TakeoverAnalysis | null> {
-    const prompt = `You are an expert Automated Bug Bounty Agent performing subdomain takeover analysis.
+const AGENT_TOOLS: OpenAI.Chat.ChatCompletionTool[] = [
+    {
+        type: 'function',
+        function: {
+            name: 'resolve_cname',
+            description: 'Resolve the CNAME record for a subdomain. Returns the canonical name if it exists, or null if no CNAME record is available.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    subdomain: {
+                        type: 'string',
+                        description: 'The subdomain to resolve (e.g., "blog.example.com")',
+                    },
+                },
+                required: ['subdomain'],
+            },
+        },
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'resolve_a_record',
+            description: 'Resolve the A record (IPv4 addresses) for a subdomain. Returns an array of IP addresses or null if resolution failed.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    subdomain: {
+                        type: 'string',
+                        description: 'The subdomain to resolve (e.g., "api.example.com")',
+                    },
+                },
+                required: ['subdomain'],
+            },
+        },
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'probe_http_status',
+            description: 'Probe the HTTP status code for a subdomain. Returns the HTTP status code (e.g., 200, 404) or null if unreachable.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    subdomain: {
+                        type: 'string',
+                        description: 'The subdomain to probe (e.g., "staging.example.com")',
+                    },
+                },
+                required: ['subdomain'],
+            },
+        },
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'check_cloud_provider',
+            description: 'Check if a CNAME target points to a known cloud provider susceptible to takeover (e.g., GitHub Pages, Vercel, S3). Returns the provider pattern if matched.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    cname: {
+                        type: 'string',
+                        description: 'The CNAME record to check (e.g., "myapp.github.io")',
+                    },
+                },
+                required: ['cname'],
+            },
+        },
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'analyze_subdomain_takeover',
+            description: 'Perform AI-powered analysis to determine if a subdomain is vulnerable to takeover. Returns structured vulnerability assessment.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    subdomain: {
+                        type: 'string',
+                        description: 'The subdomain to analyze',
+                    },
+                    cname: {
+                        type: 'string',
+                        description: 'The CNAME record, if any',
+                    },
+                    http_status: {
+                        type: 'number',
+                        description: 'The HTTP status code from probing',
+                    },
+                    ip_addresses: {
+                        type: 'array',
+                        items: { type: 'string' },
+                        description: 'Resolved A records',
+                    },
+                },
+                required: ['subdomain'],
+            },
+        },
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'generate_remediation_report',
+            description: 'Generate a professional Markdown remediation report for a confirmed vulnerability.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    subdomain: {
+                        type: 'string',
+                        description: 'The vulnerable subdomain',
+                    },
+                    cname: {
+                        type: 'string',
+                        description: 'The dangling CNAME',
+                    },
+                    http_status: {
+                        type: 'number',
+                        description: 'HTTP status code',
+                    },
+                    confidence: {
+                        type: 'string',
+                        enum: ['High', 'Medium', 'Low'],
+                        description: 'Confidence level of the vulnerability',
+                    },
+                    reasoning: {
+                        type: 'string',
+                        description: 'AI reasoning for the vulnerability',
+                    },
+                    signature_found: {
+                        type: 'string',
+                        description: 'Signature that indicates the vulnerability',
+                    },
+                },
+                required: ['subdomain', 'cname', 'http_status', 'confidence', 'reasoning', 'signature_found'],
+            },
+        },
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'mark_subdomain_safe',
+            description: 'Mark a subdomain as safe after analysis determines no takeover risk. Use when the subdomain has been fully analyzed and cleared.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    subdomain: {
+                        type: 'string',
+                        description: 'The subdomain to mark as safe',
+                    },
+                    reason: {
+                        type: 'string',
+                        description: 'Brief explanation of why it is safe',
+                    },
+                },
+                required: ['subdomain', 'reason'],
+            },
+        },
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'confirm_vulnerability',
+            description: 'Confirm and record a found vulnerability. This saves the vulnerability to the database with all evidence.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    subdomain: {
+                        type: 'string',
+                        description: 'The vulnerable subdomain',
+                    },
+                    severity: {
+                        type: 'string',
+                        enum: ['Critical', 'High', 'Medium', 'Low'],
+                        description: 'Severity level',
+                    },
+                    evidence: {
+                        type: 'string',
+                        description: 'Full remediation report as Markdown',
+                    },
+                },
+                required: ['subdomain', 'severity', 'evidence'],
+            },
+        },
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'select_next_subdomain',
+            description: 'Select the next subdomain to analyze from the discovered list. Returns the subdomain name or indicates completion.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    reasoning: {
+                        type: 'string',
+                        description: 'Why this subdomain was selected (e.g., "has interesting CNAME pattern")',
+                    },
+                },
+                required: ['reasoning'],
+            },
+        },
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'finalize_analysis',
+            description: 'Signal that the agent has completed analysis of all subdomains. Call when no more work is needed.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    summary: {
+                        type: 'string',
+                        description: 'Final summary of findings',
+                    },
+                    vulnerabilities_found: {
+                        type: 'number',
+                        description: 'Total number of vulnerabilities found',
+                    },
+                },
+                required: ['summary', 'vulnerabilities_found'],
+            },
+        },
+    },
+];
+
+// ---------------------------------------------------------------------------
+// TOOL EXECUTORS — Actual implementation of each tool
+// ---------------------------------------------------------------------------
+async function executeTool(
+    toolName: string,
+    args: Record<string, unknown>,
+    context: AgentContext
+): Promise<string> {
+    const targetId = context.targetId;
+
+    switch (toolName) {
+        case 'resolve_cname': {
+            const subdomain = args.subdomain as string;
+            await logToolCall(targetId, 'resolve_cname', subdomain, '...');
+
+            try {
+                const cnameRecords = await dns.promises.resolveCname(subdomain);
+                const cname = cnameRecords[0] ?? null;
+
+                // Update context
+                let probe = context.probedSubdomains.get(subdomain);
+                if (!probe) {
+                    probe = { subdomain, cname: null, ipAddresses: [], httpStatus: null, error: null };
+                    context.probedSubdomains.set(subdomain, probe);
+                }
+                probe.cname = cname;
+
+                const result = cname ? `CNAME → ${cname}` : 'No CNAME record found';
+                await logToolResult(targetId, result);
+                return JSON.stringify({ success: true, cname, subdomain });
+            } catch (err) {
+                const result = 'No CNAME record found (NXDOMAIN or no data)';
+                await logToolResult(targetId, result);
+                return JSON.stringify({ success: true, cname: null, subdomain, note: result });
+            }
+        }
+
+        case 'resolve_a_record': {
+            const subdomain = args.subdomain as string;
+            await logToolCall(targetId, 'resolve_a_record', subdomain, '...');
+
+            try {
+                const ipAddresses = await dns.promises.resolve4(subdomain);
+
+                let probe = context.probedSubdomains.get(subdomain);
+                if (!probe) {
+                    probe = { subdomain, cname: null, ipAddresses: [], httpStatus: null, error: null };
+                    context.probedSubdomains.set(subdomain, probe);
+                }
+                probe.ipAddresses = ipAddresses;
+
+                const result = `A-records: ${ipAddresses.join(', ')}`;
+                await logToolResult(targetId, result);
+                return JSON.stringify({ success: true, ipAddresses, subdomain });
+            } catch (err) {
+                const result = 'No A-record found';
+                await logToolResult(targetId, result);
+                return JSON.stringify({ success: true, ipAddresses: [], subdomain, note: result });
+            }
+        }
+
+        case 'probe_http_status': {
+            const subdomain = args.subdomain as string;
+            await logToolCall(targetId, 'probe_http_status', subdomain, '...');
+
+            try {
+                const controller = new AbortController();
+                const timeout = setTimeout(() => controller.abort(), 5000);
+                const response = await fetch(`http://${subdomain}`, {
+                    method: 'GET',
+                    signal: controller.signal,
+                    redirect: 'follow',
+                });
+                clearTimeout(timeout);
+
+                const httpStatus = response.status;
+
+                let probe = context.probedSubdomains.get(subdomain);
+                if (!probe) {
+                    probe = { subdomain, cname: null, ipAddresses: [], httpStatus: null, error: null };
+                    context.probedSubdomains.set(subdomain, probe);
+                }
+                probe.httpStatus = httpStatus;
+
+                // Insert to database
+                await getSupabase().from('subdomains').upsert({
+                    target_id: targetId,
+                    subdomain,
+                    cname: probe.cname,
+                    http_status: httpStatus,
+                    live_status: httpStatus < 500 ? 'live' : 'unknown',
+                }, { onConflict: 'target_id,subdomain' });
+
+                const result = `HTTP ${httpStatus}`;
+                await logToolResult(targetId, result);
+                return JSON.stringify({ success: true, http_status: httpStatus, subdomain });
+            } catch (err) {
+                const probe = context.probedSubdomains.get(subdomain);
+                const result = 'HTTP unreachable (connection refused or timed out)';
+
+                await logToolResult(targetId, result);
+                return JSON.stringify({ success: true, http_status: null, subdomain, note: result, cname: probe?.cname });
+            }
+        }
+
+        case 'check_cloud_provider': {
+            const cname = args.cname as string;
+            await logToolCall(targetId, 'check_cloud_provider', cname, '...');
+
+            const match = matchesCloudProvider(cname);
+            const result = match ? `MATCH: ${match} is a known takeover-vulnerable provider` : 'Not a known cloud provider pattern';
+
+            await logToolResult(targetId, result);
+            return JSON.stringify({ success: true, is_cloud_provider: !!match, provider: match, cname });
+        }
+
+        case 'analyze_subdomain_takeover': {
+            const subdomain = args.subdomain as string;
+            const cname = args.cname as string | null;
+            const httpStatus = args.http_status as number | null;
+            const ipAddresses = (args.ip_addresses as string[]) ?? [];
+
+            await logToolCall(targetId, 'analyze_subdomain_takeover', subdomain, '...');
+
+            const prompt = `You are an expert Automated Bug Bounty Agent performing subdomain takeover analysis.
 
 Analyze the following live asset data collected from real DNS and HTTP reconnaissance:
 
-  Subdomain   : ${probe.subdomain}
-  CNAME Record: ${probe.cname ?? 'None'}
-  A-Records   : ${probe.ipAddresses.length > 0 ? probe.ipAddresses.join(', ') : 'None'}
-  HTTP Status : ${probe.httpStatus ?? 'Unreachable / Timed-Out'}
-  Probe Error : ${probe.error ?? 'None'}
+  Subdomain   : ${subdomain}
+  CNAME Record: ${cname ?? 'None'}
+  A-Records   : ${ipAddresses.length > 0 ? ipAddresses.join(', ') : 'None'}
+  HTTP Status : ${httpStatus ?? 'Unreachable / Timed-Out'}
 
 Determine if this asset is vulnerable to a Subdomain Takeover attack.
 A subdomain is likely vulnerable when it has an active CNAME pointing to an unclaimed or deprovisioned service
@@ -247,44 +574,54 @@ Respond EXCLUSIVELY with a raw JSON object matching this exact schema (no markdo
   "signature_found": "the specific signature or string that indicates the vulnerability, or 'N/A'"
 }`;
 
-    try {
-        const completion = await aiClient.chat.completions.create({
-            model: 'openai/gpt-oss-20b',
-            messages: [{ role: 'user', content: prompt }],
-            response_format: { type: 'json_object' },
-            temperature: 0.1,
-        });
+            try {
+                const completion = await getAiClient().chat.completions.create({
+                    model: 'llama-3.3-70b-versatile',
+                    messages: [{ role: 'user', content: prompt }],
+                    response_format: { type: 'json_object' },
+                    temperature: 0.1,
+                });
 
-        const rawContent = completion.choices[0]?.message?.content ?? '{}';
-        return TakeoverAnalysisSchema.parse(JSON.parse(rawContent));
-    } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err);
-        console.error('[analyzeForTakeover] AI/parse error:', msg);
-        return null;
-    }
-}
+                const rawContent = completion.choices[0]?.message?.content ?? '{}';
+                const analysis = TakeoverAnalysisSchema.parse(JSON.parse(rawContent));
 
-// ---------------------------------------------------------------------------
-// Helper: second AI call — generate professional remediation report (Markdown)
-// ---------------------------------------------------------------------------
-async function generateRemediationReport(
-    probe: SubdomainResult,
-    analysis: TakeoverAnalysis
-): Promise<string> {
-    const prompt = `You are a senior application security engineer writing a professional bug bounty vulnerability report.
+                context.analyzedSubdomains.add(subdomain);
+
+                const result = `is_vulnerable=${analysis.is_vulnerable}, confidence=${analysis.confidence}`;
+                await logToolResult(targetId, `${result}\nReasoning: ${analysis.reasoning}`);
+
+                return JSON.stringify({ success: true, analysis, subdomain });
+            } catch (err) {
+                const msg = err instanceof Error ? err.message : String(err);
+                await logToolResult(targetId, `Analysis failed: ${msg}`);
+                return JSON.stringify({ success: false, error: msg, subdomain });
+            }
+        }
+
+        case 'generate_remediation_report': {
+            const subdomain = args.subdomain as string;
+            const cname = args.cname as string;
+            const httpStatus = args.http_status as number | null;
+            const confidence = args.confidence as string;
+            const reasoning = args.reasoning as string;
+            const signatureFound = args.signature_found as string;
+
+            await logToolCall(targetId, 'generate_remediation_report', subdomain, '...');
+
+            const prompt = `You are a senior application security engineer writing a professional bug bounty vulnerability report.
 
 The following subdomain takeover vulnerability has been confirmed by an automated reconnaissance agent:
 
-  Target Subdomain : ${probe.subdomain}
-  Dangling CNAME   : ${probe.cname ?? 'N/A'}
-  HTTP Status      : ${probe.httpStatus ?? 'Unreachable'}
-  Confidence Level : ${analysis.confidence}
-  Agent Reasoning  : ${analysis.reasoning}
-  Signature Found  : ${analysis.signature_found}
+  Target Subdomain : ${subdomain}
+  Dangling CNAME   : ${cname ?? 'N/A'}
+  HTTP Status      : ${httpStatus ?? 'Unreachable'}
+  Confidence Level : ${confidence}
+  Agent Reasoning  : ${reasoning}
+  Signature Found  : ${signatureFound}
 
 Generate a COMPLETE, professional, copy-pasteable Markdown security report with the following sections:
 
-# Subdomain Takeover — ${probe.subdomain}
+# Subdomain Takeover — ${subdomain}
 
 ## Executive Summary
 (2–3 sentences for a non-technical audience)
@@ -309,20 +646,222 @@ Generate a COMPLETE, professional, copy-pasteable Markdown security report with 
 
 Write the full report now. Do not truncate. Do not add any text before or after the Markdown.`;
 
-    try {
-        const completion = await aiClient.chat.completions.create({
-            model: 'openai/gpt-oss-20b',
-            messages: [{ role: 'user', content: prompt }],
-            temperature: 0.3,
-            max_tokens: 2048,
-        });
+            try {
+                const completion = await getAiClient().chat.completions.create({
+                    model: 'llama-3.3-70b-versatile',
+                    messages: [{ role: 'user', content: prompt }],
+                    temperature: 0.3,
+                    max_tokens: 2048,
+                });
 
-        return completion.choices[0]?.message?.content?.trim() ?? `# Report Generation Failed\n\nThe AI model did not return content for ${probe.subdomain}.`;
-    } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err);
-        console.error('[generateRemediationReport] AI error:', msg);
-        return `# Report Generation Error\n\n${msg}`;
+                const report = completion.choices[0]?.message?.content?.trim() ?? `# Report Generation Failed\n\nThe AI model did not return content for ${subdomain}.`;
+
+                await logToolResult(targetId, `Generated ${report.length} character Markdown report`);
+                return JSON.stringify({ success: true, report, subdomain });
+            } catch (err) {
+                const msg = err instanceof Error ? err.message : String(err);
+                await logToolResult(targetId, `Report generation failed: ${msg}`);
+                return JSON.stringify({ success: false, error: msg, subdomain });
+            }
+        }
+
+        case 'mark_subdomain_safe': {
+            const subdomain = args.subdomain as string;
+            const reason = args.reason as string;
+
+            context.analyzedSubdomains.add(subdomain);
+
+            await logToolCall(targetId, 'mark_subdomain_safe', subdomain, reason);
+            const result = `Marked safe: ${reason}`;
+            await logToolResult(targetId, result);
+            return JSON.stringify({ success: true, subdomain, marked_safe: true });
+        }
+
+        case 'confirm_vulnerability': {
+            const subdomain = args.subdomain as string;
+            const severity = args.severity as string;
+            const evidence = args.evidence as string;
+
+            await logToolCall(targetId, 'confirm_vulnerability', subdomain, `severity=${severity}`);
+
+            const { data: subRow } = await getSupabase()
+                .from('subdomains')
+                .select('id')
+                .eq('target_id', targetId)
+                .eq('subdomain', subdomain)
+                .maybeSingle();
+
+            await getSupabase().from('vulnerabilities').insert({
+                target_id: targetId,
+                subdomain_id: subRow?.id ?? null,
+                vuln_type: 'Subdomain Takeover',
+                severity,
+                evidence,
+            });
+
+            await logToolResult(targetId, `VULNERABILITY CONFIRMED: ${subdomain} saved to database`);
+            return JSON.stringify({ success: true, subdomain, severity });
+        }
+
+        case 'select_next_subdomain': {
+            const reasoning = args.reasoning as string;
+
+            await logToolCall(targetId, 'select_next_subdomain', '', reasoning);
+
+            // Find next unanalyzed subdomain
+            const unanalyzed = context.discoveredSubdomains.filter(s => !context.analyzedSubdomains.has(s));
+            const nextSubdomain = unanalyzed[0] ?? null;
+
+            if (nextSubdomain) {
+                context.currentFocus = nextSubdomain;
+                await logToolResult(targetId, `Selected ${nextSubdomain} for analysis`);
+                return JSON.stringify({ success: true, subdomain: nextSubdomain, remaining: unanalyzed.length - 1 });
+            } else {
+                await logToolResult(targetId, 'No more subdomains to analyze');
+                return JSON.stringify({ success: true, subdomain: null, remaining: 0, message: 'All subdomains have been analyzed' });
+            }
+        }
+
+        case 'finalize_analysis': {
+            const summary = args.summary as string;
+            const vulnerabilitiesFound = args.vulnerabilities_found as number;
+
+            await logToolCall(targetId, 'finalize_analysis', '', `vulns=${vulnerabilitiesFound}`);
+
+            await logAgentThought(targetId, 'Completed', summary, vulnerabilitiesFound > 0 ? 'warning' : 'info');
+            await getSupabase().from('targets').update({ status: 'completed' }).eq('id', targetId);
+
+            return JSON.stringify({ success: true, summary, vulnerabilities_found: vulnerabilitiesFound, target_id: targetId });
+        }
+
+        default:
+            return JSON.stringify({ success: false, error: `Unknown tool: ${toolName}` });
     }
+}
+
+// ---------------------------------------------------------------------------
+// REAct AGENT LOOP — Main orchestration
+// ---------------------------------------------------------------------------
+const MAX_ITERATIONS = 10;
+
+async function runReActAgent(context: AgentContext): Promise<void> {
+    const targetId = context.targetId;
+    const systemPrompt = `You are BountyWire Agent — an autonomous security reconnaissance agent specialized in subdomain takeover detection.
+
+Your mission: Analyze discovered subdomains and identify takeover vulnerabilities using a reasoning-action cycle.
+
+## AVAILABLE TOOLS
+- resolve_cname: Get CNAME record for a subdomain
+- resolve_a_record: Get A records (IP addresses) for a subdomain
+- probe_http_status: Check HTTP response code
+- check_cloud_provider: Test if CNAME points to a takeover-vulnerable platform
+- analyze_subdomain_takeover: AI-powered vulnerability assessment
+- generate_remediation_report: Create professional security report
+- mark_subdomain_safe: Record that a subdomain is not vulnerable
+- confirm_vulnerability: Save a confirmed vulnerability to the database
+- select_next_subdomain: Pick the next target for analysis
+- finalize_analysis: Signal completion of all work
+
+## REASONING PROCESS
+For each subdomain, follow this workflow:
+1. THINK: What information do I need?
+2. ACT: Call the appropriate tool
+3. OBSERVE: Analyze the result
+4. Repeat until confident about vulnerability status
+
+## VULNERABILITY INDICATORS
+- CNAME points to cloud provider (github.io, vercel.app, s3.amazonaws.com, etc.)
+- HTTP returns 404, 410, or is unreachable
+- CNAME resource appears deprovisioned
+
+## CONSTRAINTS
+- You have ${MAX_ITERATIONS} iterations max
+- Start by selecting a subdomain, then probe it methodically
+- Always call finalize_analysis when done
+
+## CURRENT STATE
+Domain: ${context.domain}
+Discovered Subdomains: ${context.discoveredSubdomains.length}
+Already Analyzed: ${context.analyzedSubdomains.size}
+
+Begin by selecting your first subdomain to analyze.`;
+
+    const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [
+        { role: 'system', content: systemPrompt },
+    ];
+
+    for (let iteration = 0; iteration < MAX_ITERATIONS; iteration++) {
+        await logAgentReasoning(targetId, `Starting iteration ${iteration + 1}/${MAX_ITERATIONS}...`);
+
+        try {
+            const completion = await getAiClient().chat.completions.create({
+                model: 'llama-3.3-70b-versatile',
+                messages,
+                tools: AGENT_TOOLS,
+                tool_choice: 'auto',
+                temperature: 0.2,
+            });
+
+            const assistantMessage = completion.choices[0]?.message;
+            if (!assistantMessage) break;
+
+            // Log any reasoning content
+            if (assistantMessage.content) {
+                await logAgentReasoning(targetId, assistantMessage.content);
+            }
+
+            // Add assistant message to history
+            messages.push(assistantMessage);
+
+            // Check if we have tool calls
+            const toolCalls = assistantMessage.tool_calls;
+            if (!toolCalls || toolCalls.length === 0) {
+                // No tool calls — agent is thinking or done
+                if (assistantMessage.content?.includes('finalize') || iteration >= MAX_ITERATIONS - 1) {
+                    await logAgentReasoning(targetId, 'Agent signaled completion or reached iteration limit.');
+                    break;
+                }
+                continue;
+            }
+
+            // Process each tool call
+            for (const toolCall of toolCalls) {
+                // Type guard for function tool calls
+                if (toolCall.type !== 'function') continue;
+                const toolName = toolCall.function.name;
+                const toolArgs = JSON.parse(toolCall.function.arguments);
+
+                // Execute the tool
+                const toolResult = await executeTool(toolName, toolArgs, context);
+
+                // Add tool result to message history
+                messages.push({
+                    role: 'tool',
+                    tool_call_id: toolCall.id,
+                    content: toolResult,
+                });
+
+                // Check for finalization
+                if (toolName === 'finalize_analysis') {
+                    const result = JSON.parse(toolResult);
+                    context.vulnerabilities = context.vulnerabilities.slice(0, result.vulnerabilities_found);
+                    return;
+                }
+            }
+        } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            await logAgentThought(targetId, 'Agent Error', `Error in iteration ${iteration + 1}: ${msg}`, 'warning');
+            break;
+        }
+    }
+
+    // If we exit loop without finalize, force completion
+    await logAgentThought(
+        targetId,
+        'Completed',
+        `Agent analysis complete after ${MAX_ITERATIONS} iterations. Found ${context.vulnerabilities.length} vulnerabilities.`
+    );
+    await getSupabase().from('targets').update({ status: 'completed' }).eq('id', targetId);
 }
 
 // ---------------------------------------------------------------------------
@@ -343,7 +882,7 @@ export async function POST(request: Request) {
         // -----------------------------------------------------------------------
         // Step 0: Create target record
         // -----------------------------------------------------------------------
-        const { data: targetData, error: targetError } = await supabase
+        const { data: targetData, error: targetError } = await getSupabase()
             .from('targets')
             .insert({ domain, status: 'scanning' })
             .select()
@@ -355,197 +894,92 @@ export async function POST(request: Request) {
         await logAgentThought(
             targetId,
             'Initialization',
-            `BountyWire Agent v2 initialized. Target domain: ${domain}. Beginning passive CT log discovery.`
+            `BountyWire ReAct Agent initialized. Target: ${domain}. Agent will autonomously reason and act to detect takeover vulnerabilities.`
         );
 
         // -----------------------------------------------------------------------
-        // Step 1: Active Passive Enumeration via crt.sh
+        // Step 1: Discovery Phase
         // -----------------------------------------------------------------------
         await logAgentThought(
             targetId,
-            'Enumeration',
-            `Querying crt.sh database for valid Certificate Transparency records linked to ${domain}...`
+            'Discovery',
+            `Phase 1: Discovering subdomains via Certificate Transparency logs...`
         );
 
-        let subdomainsToProbe = await fetchSubdomainsFromCrtSh(domain);
+        let discoveredSubdomains = await fetchSubdomainsFromCrtSh(domain);
 
-        // Fallback to static common array if crt.sh returns nothing or fails
-        if (subdomainsToProbe.length === 0) {
+        if (discoveredSubdomains.length === 0) {
             const staticPrefixes = ['dev', 'marketing', 'status', 'shop', 'blog', 'api', 'staging', 'admin'];
-            subdomainsToProbe = staticPrefixes.map((p) => `${p}.${domain}`);
+            discoveredSubdomains = staticPrefixes.map((p) => `${p}.${domain}`);
             await logAgentThought(
                 targetId,
-                'Enumeration',
-                `Passive discovery returned 0 records (or timed out). Falling back to static seed array.`,
+                'Discovery',
+                `CT logs returned no results. Using static seed: ${discoveredSubdomains.length} common subdomain patterns.`,
                 'warning'
             );
         }
 
-        // Circuit breaker: Cap scanning at 40 elements to fit safely inside Vercel's 5-minute timeout window
-        const maxScanCap = 40;
-        const targetTruncated = subdomainsToProbe.length > maxScanCap;
-        if (targetTruncated) {
-            subdomainsToProbe = subdomainsToProbe.slice(0, maxScanCap);
+        // Cap at 20 for agent analysis (more manageable for autonomous loop)
+        const maxSubdomains = 20;
+        const truncated = discoveredSubdomains.length > maxSubdomains;
+        if (truncated) {
+            discoveredSubdomains = discoveredSubdomains.slice(0, maxSubdomains);
         }
 
         await logAgentThought(
             targetId,
-            'Enumeration',
-            `Discovered and queued ${subdomainsToProbe.length} unique assets for verification loop.${targetTruncated ? ' (Truncated to fit platform time limit)' : ''}`
+            'Discovery',
+            `Discovered ${discoveredSubdomains.length} subdomains for agent analysis.${truncated ? ' (Capped at ' + maxSubdomains + ')' : ''}`
         );
 
-        // -----------------------------------------------------------------------
-        // Step 2: DNS + HTTP reconnaissance loop
-        // -----------------------------------------------------------------------
-        const probeResults: SubdomainResult[] = [];
-
-        for (const subdomain of subdomainsToProbe) {
-            await logAgentThought(
-                targetId,
-                'DNS Probe',
-                `Resolving ${subdomain} — checking maps and endpoints...`
-            );
-
-            const probe = await probeSubdomain(subdomain);
-            probeResults.push(probe);
-
-            if (probe.error && !probe.cname && probe.ipAddresses.length === 0) {
-                await logAgentThought(
-                    targetId,
-                    'DNS Probe',
-                    `${subdomain} → Resolution skipped. Host offline or absent.`,
-                    'info'
-                );
-                continue;
-            }
-
-            const cnameInfo = probe.cname ? `CNAME → ${probe.cname}` : `A-record → ${probe.ipAddresses.join(', ')}`;
-            const httpInfo = probe.httpStatus ? `HTTP ${probe.httpStatus}` : 'HTTP unreachable';
-
-            await logAgentThought(
-                targetId,
-                'DNS Probe',
-                `${subdomain} resolved: ${cnameInfo} | ${httpInfo}`
-            );
-
-            // Insert subdomain record
+        // Pre-populate subdomains table
+        for (const subdomain of discoveredSubdomains) {
             try {
-                await supabase.from('subdomains').insert({
+                await getSupabase().from('subdomains').insert({
                     target_id: targetId,
                     subdomain,
-                    cname: probe.cname,
-                    http_status: probe.httpStatus,
-                    live_status: probe.httpStatus && probe.httpStatus < 500 ? 'live' : 'unknown',
+                    cname: null,
+                    http_status: null,
+                    live_status: 'unknown',
                 });
             } catch {
-                // Non-fatal
+                // Ignore duplicates
             }
         }
 
         // -----------------------------------------------------------------------
-        // Step 3: Agentic analysis loop — evaluate candidates for takeover
+        // Step 2: Initialize Agent Context
+        // -----------------------------------------------------------------------
+        const context: AgentContext = {
+            targetId,
+            domain,
+            discoveredSubdomains,
+            probedSubdomains: new Map(),
+            analyzedSubdomains: new Set(),
+            vulnerabilities: [],
+            currentFocus: null,
+        };
+
+        // -----------------------------------------------------------------------
+        // Step 3: Run the Autonomous ReAct Agent
         // -----------------------------------------------------------------------
         await logAgentThought(
             targetId,
-            'Analysis Loop',
-            `Reconnaissance complete. Evaluating ${probeResults.length} probed subdomains for takeover indicators...`
+            'Agent Start',
+            `Activating autonomous reasoning loop. Agent will dynamically select tools, perform on-demand probes, and analyze results.`
         );
 
-        let vulnerabilitiesFound = 0;
-
-        for (const probe of probeResults) {
-            if (!probe.cname && probe.ipAddresses.length === 0) continue;
-
-            const isCloudCname = probe.cname ? matchesCloudProvider(probe.cname) : null;
-            const isSuspectStatus =
-                probe.httpStatus === null || probe.httpStatus === 404 || probe.httpStatus === 410;
-
-            if (!isCloudCname || !isSuspectStatus) {
-                await logAgentThought(
-                    targetId,
-                    'Analysis Loop',
-                    `${probe.subdomain} → Not a takeover candidate (CNAME: ${probe.cname ?? 'none'}, HTTP: ${probe.httpStatus ?? 'N/A'}). Skipping AI analysis.`
-                );
-                continue;
-            }
-
-            await logAgentThought(
-                targetId,
-                'Analysis Loop',
-                `⚠ Suspicious pattern detected on ${probe.subdomain}: CNAME points to ${probe.cname} with HTTP ${probe.httpStatus ?? 'unreachable'}. Escalating to AI...`,
-                'warning'
-            );
-
-            const analysis = await analyzeForTakeover(probe);
-
-            if (!analysis) {
-                await logAgentThought(
-                    targetId,
-                    'Analysis Loop',
-                    `AI analysis failed for ${probe.subdomain}. Skipping.`,
-                    'warning'
-                );
-                continue;
-            }
-
-            await logAgentThought(
-                targetId,
-                'Takeover Verification',
-                `AI verdict for ${probe.subdomain}: is_vulnerable=${analysis.is_vulnerable}. Reasoning: ${analysis.reasoning}`,
-                analysis.is_vulnerable ? 'warning' : 'info'
-            );
-
-            if (analysis.is_vulnerable) {
-                vulnerabilitiesFound++;
-
-                const { data: subRow } = await supabase
-                    .from('subdomains')
-                    .select('id')
-                    .eq('target_id', targetId)
-                    .eq('subdomain', probe.subdomain)
-                    .maybeSingle();
-
-                await logAgentThought(
-                    targetId,
-                    'Report Generation',
-                    `Generating professional remediation advisory report for ${probe.subdomain}...`
-                );
-
-                const remediationReport = await generateRemediationReport(probe, analysis);
-
-                await supabase.from('vulnerabilities').insert({
-                    target_id: targetId,
-                    subdomain_id: subRow?.id ?? null,
-                    vuln_type: 'Subdomain Takeover',
-                    severity: analysis.confidence === 'High' ? 'Critical' : analysis.confidence === 'Medium' ? 'High' : 'Medium',
-                    evidence: remediationReport,
-                });
-
-                await logAgentThought(
-                    targetId,
-                    'Takeover Verification',
-                    `🚨 VULNERABILITY CONFIRMED on ${probe.subdomain}. Full remediation report saved.`,
-                    'critical'
-                );
-            }
-        }
+        await runReActAgent(context);
 
         // -----------------------------------------------------------------------
-        // Step 4: Finalize
+        // Step 4: Return Summary
         // -----------------------------------------------------------------------
-        const summary =
-            vulnerabilitiesFound > 0
-                ? `Scan complete. ${vulnerabilitiesFound} subdomain takeover vulnerability(ies) confirmed and reported for ${domain}.`
-                : `Scan complete. No subdomain takeover vulnerabilities detected for ${domain}. All probed subdomains appear safe.`;
-
-        await logAgentThought(targetId, 'Completed', summary);
-        await supabase.from('targets').update({ status: 'completed' }).eq('id', targetId);
-
         return NextResponse.json({
             success: true,
             target_id: targetId,
-            vulnerabilities_found: vulnerabilitiesFound,
-            subdomains_probed: probeResults.length,
+            vulnerabilities_found: context.vulnerabilities.length,
+            subdomains_discovered: discoveredSubdomains.length,
+            subdomains_analyzed: context.analyzedSubdomains.size,
         });
 
     } catch (error: unknown) {
@@ -553,7 +987,7 @@ export async function POST(request: Request) {
         console.error('[POST /api/scan] Fatal agent exception:', msg);
         if (targetId) {
             await logAgentThought(targetId, 'Failed', `Critical engine exception: ${msg}`, 'critical');
-            await supabase.from('targets').update({ status: 'failed' }).eq('id', targetId);
+            await getSupabase().from('targets').update({ status: 'failed' }).eq('id', targetId);
         }
         return NextResponse.json({ error: msg }, { status: 500 });
     }
