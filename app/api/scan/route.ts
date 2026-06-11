@@ -42,7 +42,7 @@ function getAiClient() {
     });
 }
 
-const REACT_MODEL = process.env.GROQ_MODEL || 'groq/compound';
+const REACT_MODEL = 'llama-3.3-70b-versatile';
 
 
 // ---------------------------------------------------------------------------
