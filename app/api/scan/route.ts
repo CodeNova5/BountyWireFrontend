@@ -20,12 +20,30 @@ function getSupabase() {
     );
 }
 
+const GROQ_KEYS = [
+    process.env.GROQ_API_KEY,
+    process.env.GROQ_API_KEY_1,
+].filter((key): key is string => !!key);
+
+let keyIndex = 0;
+function getGroqApiKey(): string {
+    if (GROQ_KEYS.length === 0) {
+        throw new Error('No Groq API keys configured. Please set GROQ_API_KEY in your environment.');
+    }
+    const apiKey = GROQ_KEYS[keyIndex % GROQ_KEYS.length];
+    keyIndex++;
+    return apiKey;
+}
+
 function getAiClient() {
     return new OpenAI({
         baseURL: 'https://api.groq.com/openai/v1',
-        apiKey: process.env.GROQ_API_KEY!,
+        apiKey: getGroqApiKey(),
     });
 }
+
+const REACT_MODEL = process.env.GROQ_MODEL || 'groq/compound';
+
 
 // ---------------------------------------------------------------------------
 // Zod schema — enforces strict structured output from the AI
@@ -177,12 +195,101 @@ async function fetchSubdomainsFromCrtSh(domain: string): Promise<string[]> {
 }
 
 // ---------------------------------------------------------------------------
+// Parallel DNS and HTTP Pre-Filtering Helpers
+// ---------------------------------------------------------------------------
+async function processInBatches<T, R>(
+    items: T[],
+    batchSize: number,
+    fn: (item: T) => Promise<R>
+): Promise<R[]> {
+    const results: R[] = [];
+    for (let i = 0; i < items.length; i += batchSize) {
+        const batch = items.slice(i, i + batchSize);
+        const batchResults = await Promise.all(batch.map(fn));
+        results.push(...batchResults);
+    }
+    return results;
+}
+
+function isSuspiciousSubdomain(cname: string | null, ipAddresses: string[], httpStatus: number | null): boolean {
+    if (!cname && ipAddresses.length === 0 && httpStatus === null) {
+        // Completely dead and no CNAME – not resolvable, no dangling record
+        return false;
+    }
+    if (cname) {
+        // Points to known cloud provider (always suspicious)
+        if (matchesCloudProvider(cname)) return true;
+        // Dangling entry (has CNAME but no IPs or HTTP error/unreachable)
+        if (ipAddresses.length === 0 || httpStatus === 404 || httpStatus === 410 || httpStatus === null) {
+            return true;
+        }
+    }
+    // If no CNAME but returns 404 or 410 or is unreachable, let the agent inspect
+    if (httpStatus === 404 || httpStatus === 410 || httpStatus === null) {
+        return true;
+    }
+    return false;
+}
+
+async function probeSubdomainQuick(
+    subdomain: string
+): Promise<SubdomainResult & { ipAddresses: string[]; isSuspicious: boolean }> {
+    let cname: string | null = null;
+    let ipAddresses: string[] = [];
+    let httpStatus: number | null = null;
+    let error: string | null = null;
+
+    // 1. Resolve CNAME
+    try {
+        const cnames = await dns.promises.resolveCname(subdomain);
+        cname = cnames[0] ?? null;
+    } catch (err: any) {
+        // Ignore resolution error
+    }
+
+    // 2. Resolve A records
+    try {
+        ipAddresses = await dns.promises.resolve4(subdomain);
+    } catch (err: any) {
+        error = err.message || String(err);
+    }
+
+    // 3. Probe HTTP status
+    try {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 4000);
+        const response = await fetch(`http://${subdomain}`, {
+            method: 'GET',
+            signal: controller.signal,
+            redirect: 'follow',
+        });
+        clearTimeout(timeout);
+        httpStatus = response.status;
+    } catch (err: any) {
+        // Unreachable
+    }
+
+    const isSuspicious = isSuspiciousSubdomain(cname, ipAddresses, httpStatus);
+
+    return {
+        subdomain,
+        cname,
+        ipAddresses,
+        httpStatus,
+        error,
+        isSuspicious,
+    };
+}
+
+
+// ---------------------------------------------------------------------------
 // Cloud provider patterns for takeover detection
 // ---------------------------------------------------------------------------
 const CLOUD_TAKEOVER_PATTERNS: RegExp[] = [
     /\.wordpress\.com$/i,
     /\.github\.io$/i,
     /\.vercel\.app$/i,
+    /\.vercel-dns\.com$/i, // <-- Add this to catch custom domain CNAMEs
     /\.netlify\.app$/i,
     /\.cloudfront\.net$/i,
     /\.s3\.amazonaws\.com$/i,
@@ -203,6 +310,8 @@ const CLOUD_TAKEOVER_PATTERNS: RegExp[] = [
     /\.zendesk\.com$/i,
     /\.freshdesk\.com$/i,
     /\.statuspage\.io$/i,
+    /\.edgekey\.net$/i,   // Akamai Edge Suite
+    /\.edgesuite\.net$/i,  // Akamai
 ];
 
 function matchesCloudProvider(cname: string): string | null {
@@ -458,12 +567,17 @@ async function executeTool(
             const subdomain = args.subdomain as string;
             await logToolCall(targetId, 'resolve_cname', subdomain, '...');
 
+            let probe = context.probedSubdomains.get(subdomain);
+            if (probe && probe.cname !== undefined) {
+                const result = probe.cname ? `CNAME → ${probe.cname}` : 'No CNAME record found';
+                await logToolResult(targetId, `(Cached) ${result}`);
+                return JSON.stringify({ success: true, cname: probe.cname, subdomain });
+            }
+
             try {
                 const cnameRecords = await dns.promises.resolveCname(subdomain);
                 const cname = cnameRecords[0] ?? null;
 
-                // Update context
-                let probe = context.probedSubdomains.get(subdomain);
                 if (!probe) {
                     probe = { subdomain, cname: null, ipAddresses: [], httpStatus: null, error: null };
                     context.probedSubdomains.set(subdomain, probe);
@@ -484,10 +598,16 @@ async function executeTool(
             const subdomain = args.subdomain as string;
             await logToolCall(targetId, 'resolve_a_record', subdomain, '...');
 
+            let probe = context.probedSubdomains.get(subdomain);
+            if (probe && probe.ipAddresses && probe.ipAddresses.length > 0) {
+                const result = `A-records: ${probe.ipAddresses.join(', ')}`;
+                await logToolResult(targetId, `(Cached) ${result}`);
+                return JSON.stringify({ success: true, ipAddresses: probe.ipAddresses, subdomain });
+            }
+
             try {
                 const ipAddresses = await dns.promises.resolve4(subdomain);
 
-                let probe = context.probedSubdomains.get(subdomain);
                 if (!probe) {
                     probe = { subdomain, cname: null, ipAddresses: [], httpStatus: null, error: null };
                     context.probedSubdomains.set(subdomain, probe);
@@ -508,6 +628,13 @@ async function executeTool(
             const subdomain = args.subdomain as string;
             await logToolCall(targetId, 'probe_http_status', subdomain, '...');
 
+            let probe = context.probedSubdomains.get(subdomain);
+            if (probe && (probe.httpStatus !== null || probe.error !== null)) {
+                const result = probe.httpStatus ? `HTTP ${probe.httpStatus}` : 'HTTP unreachable (cached)';
+                await logToolResult(targetId, `(Cached) ${result}`);
+                return JSON.stringify({ success: true, http_status: probe.httpStatus, subdomain, note: probe.error || 'HTTP unreachable (cached)' });
+            }
+
             try {
                 const controller = new AbortController();
                 const timeout = setTimeout(() => controller.abort(), 5000);
@@ -520,7 +647,6 @@ async function executeTool(
 
                 const httpStatus = response.status;
 
-                let probe = context.probedSubdomains.get(subdomain);
                 if (!probe) {
                     probe = { subdomain, cname: null, ipAddresses: [], httpStatus: null, error: null };
                     context.probedSubdomains.set(subdomain, probe);
@@ -540,8 +666,13 @@ async function executeTool(
                 await logToolResult(targetId, result);
                 return JSON.stringify({ success: true, http_status: httpStatus, subdomain });
             } catch (err) {
-                const probe = context.probedSubdomains.get(subdomain);
                 const result = 'HTTP unreachable (connection refused or timed out)';
+
+                if (!probe) {
+                    probe = { subdomain, cname: null, ipAddresses: [], httpStatus: null, error: null };
+                    context.probedSubdomains.set(subdomain, probe);
+                }
+                probe.error = result;
 
                 await logToolResult(targetId, result);
                 return JSON.stringify({ success: true, http_status: null, subdomain, note: result, cname: probe?.cname });
@@ -591,7 +722,7 @@ Respond EXCLUSIVELY with a raw JSON object matching this exact schema (no markdo
 
             try {
                 const completion = await getAiClient().chat.completions.create({
-                    model: 'llama-3.3-70b-versatile',
+                    model: REACT_MODEL,
                     messages: [{ role: 'user', content: prompt }],
                     response_format: { type: 'json_object' },
                     temperature: 0.1,
@@ -663,7 +794,7 @@ Write the full report now. Do not truncate. Do not add any text before or after 
 
             try {
                 const completion = await getAiClient().chat.completions.create({
-                    model: 'llama-3.3-70b-versatile',
+                    model: REACT_MODEL,
                     messages: [{ role: 'user', content: prompt }],
                     temperature: 0.3,
                     max_tokens: 2048,
@@ -757,7 +888,7 @@ Write the full report now. Do not truncate. Do not add any text before or after 
 // ---------------------------------------------------------------------------
 // REAct AGENT LOOP — Main orchestration
 // ---------------------------------------------------------------------------
-const MAX_ITERATIONS = 10;
+const MAX_ITERATIONS = 60;
 
 async function runReActAgent(context: AgentContext): Promise<void> {
     const targetId = context.targetId;
@@ -810,7 +941,7 @@ Begin by selecting your first subdomain to analyze.`;
 
         try {
             const completion = await getAiClient().chat.completions.create({
-                model: 'llama-3.3-70b-versatile',
+                model: REACT_MODEL,
                 messages,
                 tools: AGENT_TOOLS,
                 tool_choice: 'auto',
@@ -938,42 +1069,89 @@ export async function POST(request: Request) {
                     return;
                 }
 
-                // Cap at 20 for agent analysis
-                const maxSubdomains = 20;
-                const truncated = discoveredSubdomains.length > maxSubdomains;
+                // Cap at 40 subdomains for the pre-filtering phase
+                const maxPreFilterSubdomains = 40;
+                const truncated = discoveredSubdomains.length > maxPreFilterSubdomains;
                 if (truncated) {
-                    discoveredSubdomains = discoveredSubdomains.slice(0, maxSubdomains);
+                    discoveredSubdomains = discoveredSubdomains.slice(0, maxPreFilterSubdomains);
                 }
 
                 await logAgentThought(
                     targetId!,
                     'Discovery',
-                    `Discovered ${discoveredSubdomains.length} subdomains for agent analysis.${truncated ? ' (Capped at ' + maxSubdomains + ')' : ''}`
+                    `Discovered ${discoveredSubdomains.length} subdomains. Running parallel DNS/HTTP pre-filtering step...`
                 );
 
-                // Pre-populate subdomains table
-                for (const subdomain of discoveredSubdomains) {
+                // Run DNS & HTTP pre-filtering in parallel batches (concurrency: 5)
+                const preFilterResults = await processInBatches(discoveredSubdomains, 5, probeSubdomainQuick);
+
+                // Save all results to database and update UI
+                for (const res of preFilterResults) {
                     try {
                         await getSupabase().from('subdomains').insert({
                             target_id: targetId!,
-                            subdomain,
-                            cname: null,
-                            http_status: null,
-                            live_status: 'unknown',
+                            subdomain: res.subdomain,
+                            cname: res.cname,
+                            http_status: res.httpStatus,
+                            live_status: res.httpStatus !== null && res.httpStatus < 500 ? 'live' : 'unknown',
                         });
                     } catch {
-                        // Ignore duplicates
+                        // In case of conflict, upsert to update values
+                        try {
+                            await getSupabase().from('subdomains').upsert({
+                                target_id: targetId!,
+                                subdomain: res.subdomain,
+                                cname: res.cname,
+                                http_status: res.httpStatus,
+                                live_status: res.httpStatus !== null && res.httpStatus < 500 ? 'live' : 'unknown',
+                            }, { onConflict: 'target_id,subdomain' });
+                        } catch (upsertErr) {
+                            console.error('Failed to upsert subdomain result:', upsertErr);
+                        }
                     }
                 }
 
+                // Filter to find suspicious subdomains
+                const suspiciousResults = preFilterResults.filter(res => res.isSuspicious);
+                const suspiciousSubdomains = suspiciousResults.map(res => res.subdomain);
+
+                await logAgentThought(
+                    targetId!,
+                    'Discovery',
+                    `Pre-filtering complete. Found ${suspiciousSubdomains.length} subdomains exhibiting suspicious footprints (404s, dangling entries).`
+                );
+
+                // If no subdomains are suspicious, we terminate early!
+                if (suspiciousSubdomains.length === 0) {
+                    await logAgentThought(
+                        targetId!,
+                        'Completed',
+                        `All discovered subdomains cleared during pre-filtering (no suspicious footprints found). Terminating scan.`,
+                        'info'
+                    );
+                    await getSupabase().from('targets').update({ status: 'completed' }).eq('id', targetId);
+                    return;
+                }
+
                 // -----------------------------------------------------------------------
-                // Step 2: Initialize Agent Context
+                // Step 2: Initialize Agent Context with pre-populated probe results
                 // -----------------------------------------------------------------------
+                const probedMap = new Map<string, SubdomainResult>();
+                for (const res of preFilterResults) {
+                    probedMap.set(res.subdomain, {
+                        subdomain: res.subdomain,
+                        cname: res.cname,
+                        ipAddresses: res.ipAddresses,
+                        httpStatus: res.httpStatus,
+                        error: res.error,
+                    });
+                }
+
                 const context: AgentContext = {
                     targetId: targetId!,
                     domain,
-                    discoveredSubdomains,
-                    probedSubdomains: new Map(),
+                    discoveredSubdomains: suspiciousSubdomains,
+                    probedSubdomains: probedMap,
                     analyzedSubdomains: new Set(),
                     vulnerabilities: [],
                     currentFocus: null,
@@ -985,7 +1163,7 @@ export async function POST(request: Request) {
                 await logAgentThought(
                     targetId!,
                     'Agent Start',
-                    `Activating autonomous reasoning loop. Agent will dynamically select tools, perform on-demand probes, and analyze results.`
+                    `Activating autonomous reasoning loop. Agent will analyze ${suspiciousSubdomains.length} suspicious subdomains using pre-populated DNS/HTTP cache.`
                 );
 
                 await runReActAgent(context);
