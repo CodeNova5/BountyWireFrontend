@@ -102,27 +102,44 @@ async function logToolResult(targetId: string, result: string): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// Helper: Fetch subdomains from crt.sh JSON API with Multi-Source Fallback
+// Helper: Fetch subdomains from crt.sh JSON API with Retries
 // ---------------------------------------------------------------------------
 async function fetchSubdomainsFromCrtSh(domain: string): Promise<string[]> {
     const subdomainsSet = new Set<string>();
 
-    // Source 1: Optimized crt.sh Query
-    try {
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 6000);
+    const fetchWithRetry = async (url: string, maxRetries = 3, timeoutMs = 25000) => {
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), timeoutMs);
+            try {
+                const response = await fetch(url, {
+                    signal: controller.signal,
+                    headers: {
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (BountyWire/1.0)',
+                        'Accept': 'application/json'
+                    }
+                });
+                clearTimeout(timeout);
 
-        const response = await fetch(`https://crt.sh/?q=${domain}&output=json&exclude=expired`, {
-            signal: controller.signal,
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+                const text = await response.text();
+                return JSON.parse(text); // Will throw if crt.sh returns an HTML error page
+            } catch (err) {
+                clearTimeout(timeout);
+                if (attempt === maxRetries) throw err;
+                // Exponential backoff: 2s, 4s...
+                await new Promise(r => setTimeout(r, attempt * 2000));
             }
-        });
-        clearTimeout(timeout);
+        }
+    };
 
-        if (response.ok) {
-            const data = await response.json() as Array<{ name_value: string }>;
+    // Source 1: Optimized crt.sh Query (using %. wildcard to target subdomains)
+    try {
+        const data = await fetchWithRetry(`https://crt.sh/?q=%.${domain}&output=json&exclude=expired`, 3, 25000);
+        if (Array.isArray(data)) {
             for (const item of data) {
+                if (!item.name_value) continue;
                 const names = item.name_value.toLowerCase().split('\n');
                 for (let name of names) {
                     name = name.replace(/^\*\./, '').trim();
@@ -133,23 +150,16 @@ async function fetchSubdomainsFromCrtSh(domain: string): Promise<string[]> {
             }
         }
     } catch (err) {
-        console.warn('[fetchSubdomainsFromCrtSh] crt.sh timed out or failed. Pivoting to Certspotter...');
+        console.warn('[fetchSubdomainsFromCrtSh] crt.sh failed after retries:', err);
     }
 
-    // Source 2: Certspotter API Fallback
+    // Source 2: Certspotter API Fallback (runs if crt.sh completely fails or returns empty)
     if (subdomainsSet.size === 0) {
         try {
-            const controller = new AbortController();
-            const timeout = setTimeout(() => controller.abort(), 5000);
-
-            const response = await fetch(`https://api.certspotter.com/v1/issuances?domain=${domain}&include_subdomains=true&expand=dns_names`, {
-                signal: controller.signal
-            });
-            clearTimeout(timeout);
-
-            if (response.ok) {
-                const data = await response.json() as Array<{ dns_names: string[] }>;
+            const data = await fetchWithRetry(`https://api.certspotter.com/v1/issuances?domain=${domain}&include_subdomains=true&expand=dns_names`, 2, 10000);
+            if (Array.isArray(data)) {
                 for (const item of data) {
+                    if (!item.dns_names) continue;
                     for (let name of item.dns_names) {
                         name = name.toLowerCase().replace(/^\*\./, '').trim();
                         if (name && name.endsWith(domain) && name !== domain) {
@@ -276,6 +286,8 @@ const AGENT_TOOLS: OpenAI.Chat.ChatCompletionTool[] = [
             },
         },
     },
+
+
     {
         type: 'function',
         function: {
@@ -289,11 +301,11 @@ const AGENT_TOOLS: OpenAI.Chat.ChatCompletionTool[] = [
                         description: 'The subdomain to analyze',
                     },
                     cname: {
-                        type: 'string',
+                        type: ['string', 'null'], // <-- Updated
                         description: 'The CNAME record, if any',
                     },
                     http_status: {
-                        type: 'number',
+                        type: ['number', 'null'], // <-- Updated
                         description: 'The HTTP status code from probing',
                     },
                     ip_addresses: {
@@ -319,11 +331,11 @@ const AGENT_TOOLS: OpenAI.Chat.ChatCompletionTool[] = [
                         description: 'The vulnerable subdomain',
                     },
                     cname: {
-                        type: 'string',
+                        type: ['string', 'null'], // <-- Updated
                         description: 'The dangling CNAME',
                     },
                     http_status: {
-                        type: 'number',
+                        type: ['number', 'null'], // <-- Updated
                         description: 'HTTP status code',
                     },
                     confidence: {
@@ -914,18 +926,19 @@ export async function POST(request: Request) {
 
                 let discoveredSubdomains = await fetchSubdomainsFromCrtSh(domain);
 
+                // Terminate cleanly if no subdomains are found naturally
                 if (discoveredSubdomains.length === 0) {
-                    const staticPrefixes = ['dev', 'marketing', 'status', 'shop', 'blog', 'api', 'staging', 'admin'];
-                    discoveredSubdomains = staticPrefixes.map((p) => `${p}.${domain}`);
                     await logAgentThought(
                         targetId!,
-                        'Discovery',
-                        `CT logs returned no results. Using static seed: ${discoveredSubdomains.length} common subdomain patterns.`,
+                        'Completed',
+                        `No subdomains discovered for ${domain}. Terminating analysis.`,
                         'warning'
                     );
+                    await getSupabase().from('targets').update({ status: 'completed' }).eq('id', targetId);
+                    return;
                 }
 
-                // Cap at 20 for agent analysis (more manageable for autonomous loop)
+                // Cap at 20 for agent analysis
                 const maxSubdomains = 20;
                 const truncated = discoveredSubdomains.length > maxSubdomains;
                 if (truncated) {
