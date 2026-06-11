@@ -1,4 +1,4 @@
-import { NextResponse } from 'next/server';
+import { NextResponse, after } from 'next/server';
 import { createClient } from '@supabase/supabase-js';
 import OpenAI from 'openai';
 import { z } from 'zod';
@@ -894,100 +894,110 @@ export async function POST(request: Request) {
         if (targetError) throw new Error(`Failed to create target: ${targetError.message}`);
         targetId = targetData.id as string;
 
-        await logAgentThought(
-            targetId,
-            'Initialization',
-            `BountyWire ReAct Agent initialized. Target: ${domain}. Agent will autonomously reason and act to detect takeover vulnerabilities.`
-        );
-
-        // -----------------------------------------------------------------------
-        // Step 1: Discovery Phase
-        // -----------------------------------------------------------------------
-        await logAgentThought(
-            targetId,
-            'Discovery',
-            `Phase 1: Discovering subdomains via Certificate Transparency logs...`
-        );
-
-        let discoveredSubdomains = await fetchSubdomainsFromCrtSh(domain);
-
-        if (discoveredSubdomains.length === 0) {
-            const staticPrefixes = ['dev', 'marketing', 'status', 'shop', 'blog', 'api', 'staging', 'admin'];
-            discoveredSubdomains = staticPrefixes.map((p) => `${p}.${domain}`);
-            await logAgentThought(
-                targetId,
-                'Discovery',
-                `CT logs returned no results. Using static seed: ${discoveredSubdomains.length} common subdomain patterns.`,
-                'warning'
-            );
-        }
-
-        // Cap at 20 for agent analysis (more manageable for autonomous loop)
-        const maxSubdomains = 20;
-        const truncated = discoveredSubdomains.length > maxSubdomains;
-        if (truncated) {
-            discoveredSubdomains = discoveredSubdomains.slice(0, maxSubdomains);
-        }
-
-        await logAgentThought(
-            targetId,
-            'Discovery',
-            `Discovered ${discoveredSubdomains.length} subdomains for agent analysis.${truncated ? ' (Capped at ' + maxSubdomains + ')' : ''}`
-        );
-
-        // Pre-populate subdomains table
-        for (const subdomain of discoveredSubdomains) {
+        // Perform the scan asynchronously using Next.js after()
+        after(async () => {
             try {
-                await getSupabase().from('subdomains').insert({
-                    target_id: targetId,
-                    subdomain,
-                    cname: null,
-                    http_status: null,
-                    live_status: 'unknown',
-                });
-            } catch {
-                // Ignore duplicates
+                await logAgentThought(
+                    targetId!,
+                    'Initialization',
+                    `BountyWire ReAct Agent initialized. Target: ${domain}. Agent will autonomously reason and act to detect takeover vulnerabilities.`
+                );
+
+                // -----------------------------------------------------------------------
+                // Step 1: Discovery Phase
+                // -----------------------------------------------------------------------
+                await logAgentThought(
+                    targetId!,
+                    'Discovery',
+                    `Phase 1: Discovering subdomains via Certificate Transparency logs...`
+                );
+
+                let discoveredSubdomains = await fetchSubdomainsFromCrtSh(domain);
+
+                if (discoveredSubdomains.length === 0) {
+                    const staticPrefixes = ['dev', 'marketing', 'status', 'shop', 'blog', 'api', 'staging', 'admin'];
+                    discoveredSubdomains = staticPrefixes.map((p) => `${p}.${domain}`);
+                    await logAgentThought(
+                        targetId!,
+                        'Discovery',
+                        `CT logs returned no results. Using static seed: ${discoveredSubdomains.length} common subdomain patterns.`,
+                        'warning'
+                    );
+                }
+
+                // Cap at 20 for agent analysis (more manageable for autonomous loop)
+                const maxSubdomains = 20;
+                const truncated = discoveredSubdomains.length > maxSubdomains;
+                if (truncated) {
+                    discoveredSubdomains = discoveredSubdomains.slice(0, maxSubdomains);
+                }
+
+                await logAgentThought(
+                    targetId!,
+                    'Discovery',
+                    `Discovered ${discoveredSubdomains.length} subdomains for agent analysis.${truncated ? ' (Capped at ' + maxSubdomains + ')' : ''}`
+                );
+
+                // Pre-populate subdomains table
+                for (const subdomain of discoveredSubdomains) {
+                    try {
+                        await getSupabase().from('subdomains').insert({
+                            target_id: targetId!,
+                            subdomain,
+                            cname: null,
+                            http_status: null,
+                            live_status: 'unknown',
+                        });
+                    } catch {
+                        // Ignore duplicates
+                    }
+                }
+
+                // -----------------------------------------------------------------------
+                // Step 2: Initialize Agent Context
+                // -----------------------------------------------------------------------
+                const context: AgentContext = {
+                    targetId: targetId!,
+                    domain,
+                    discoveredSubdomains,
+                    probedSubdomains: new Map(),
+                    analyzedSubdomains: new Set(),
+                    vulnerabilities: [],
+                    currentFocus: null,
+                };
+
+                // -----------------------------------------------------------------------
+                // Step 3: Run the Autonomous ReAct Agent
+                // -----------------------------------------------------------------------
+                await logAgentThought(
+                    targetId!,
+                    'Agent Start',
+                    `Activating autonomous reasoning loop. Agent will dynamically select tools, perform on-demand probes, and analyze results.`
+                );
+
+                await runReActAgent(context);
+
+            } catch (error: unknown) {
+                const msg = error instanceof Error ? error.message : String(error);
+                console.error('[POST /api/scan background task] Fatal agent exception:', msg);
+                if (targetId) {
+                    await logAgentThought(targetId, 'Failed', `Critical engine exception: ${msg}`, 'critical');
+                    await getSupabase().from('targets').update({ status: 'failed' }).eq('id', targetId);
+                }
             }
-        }
+        });
 
         // -----------------------------------------------------------------------
-        // Step 2: Initialize Agent Context
-        // -----------------------------------------------------------------------
-        const context: AgentContext = {
-            targetId,
-            domain,
-            discoveredSubdomains,
-            probedSubdomains: new Map(),
-            analyzedSubdomains: new Set(),
-            vulnerabilities: [],
-            currentFocus: null,
-        };
-
-        // -----------------------------------------------------------------------
-        // Step 3: Run the Autonomous ReAct Agent
-        // -----------------------------------------------------------------------
-        await logAgentThought(
-            targetId,
-            'Agent Start',
-            `Activating autonomous reasoning loop. Agent will dynamically select tools, perform on-demand probes, and analyze results.`
-        );
-
-        await runReActAgent(context);
-
-        // -----------------------------------------------------------------------
-        // Step 4: Return Summary
+        // Step 4: Return Target ID immediately to the client
         // -----------------------------------------------------------------------
         return NextResponse.json({
             success: true,
             target_id: targetId,
-            vulnerabilities_found: context.vulnerabilities.length,
-            subdomains_discovered: discoveredSubdomains.length,
-            subdomains_analyzed: context.analyzedSubdomains.size,
         });
 
     } catch (error: unknown) {
         const msg = error instanceof Error ? error.message : String(error);
-        console.error('[POST /api/scan] Fatal agent exception:', msg);
+        console.error('[POST /api/scan] Fatal exception:', msg);
         if (targetId) {
             await logAgentThought(targetId, 'Failed', `Critical engine exception: ${msg}`, 'critical');
             await getSupabase().from('targets').update({ status: 'failed' }).eq('id', targetId);

@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { createClient } from '@supabase/supabase-js';
-import { Shield, Terminal, TriangleAlert as AlertTriangle, CircleCheck as CheckCircle, Search, Loader as Loader2, Clock, ChevronRight, Database, Wifi, WifiOff, FileText, X, ExternalLink, Brain, Wrench, Zap, Activity, Cpu, Eye, Sparkles, ShieldCheck, Download, Radar, Scan, Target, Bug, OctagonAlert as AlertOctagon, TrendingUp, Zap as Lightning, Gauge, ArrowUp, ArrowDown } from 'lucide-react';
+import { Shield, Terminal, TriangleAlert as AlertTriangle, CircleCheck as CheckCircle, Search, Loader as Loader2, Clock, ChevronRight, Database, Wifi, WifiOff, FileText, X, ExternalLink, Brain, Wrench, Zap, Activity, Cpu, Eye, Sparkles, ShieldCheck, Download, Radar, Scan, Target, Bug, OctagonAlert as AlertOctagon, TrendingUp, Zap as Lightning, Gauge, ArrowUp, ArrowDown, Share2 } from 'lucide-react';
 
 const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!;
 const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
@@ -106,7 +106,8 @@ function ThreatGauge({ vulnerabilityCount, isScanning }: { vulnerabilityCount: n
 // ---------------------------------------------------------------------------
 function GlobalStyles() {
   return (
-    <style dangerouslySetInnerHTML={{ __html: `
+    <style dangerouslySetInnerHTML={{
+      __html: `
       @keyframes shimmer {
         0% { transform: translateX(-100%); }
         100% { transform: translateX(400%); }
@@ -313,7 +314,7 @@ function logRowLeftAccent(log: Log) {
 // ---------------------------------------------------------------------------
 export default function SecurityDashboard() {
   const [domain, setDomain] = useState('');
-  const [isScanning, setIsScanning] = useState(false);
+  const [isStartingScan, setIsStartingScan] = useState(false);
   const [activeTarget, setActiveTarget] = useState<Target | null>(null);
   const [targets, setTargets] = useState<Target[]>([]);
   const [logs, setLogs] = useState<Log[]>([]);
@@ -321,6 +322,8 @@ export default function SecurityDashboard() {
   const [vulns, setVulns] = useState<Vulnerability[]>([]);
   const [selectedReport, setSelectedReport] = useState<Vulnerability | null>(null);
   const logsEndRef = useRef<HTMLDivElement>(null);
+
+  const isScanning = isStartingScan || (activeTarget?.status === 'scanning');
 
   const scrollToBottom = () => {
     logsEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -339,52 +342,34 @@ export default function SecurityDashboard() {
     }
   }, []);
 
-  const fetchLogs = useCallback(async (targetId: string) => {
-    try {
-      const { data } = await supabase.from('agent_logs').select('*').eq('target_id', targetId).order('timestamp', { ascending: true });
-      setLogs(data as Log[]);
-    } catch (error) {
-      console.error('Error fetching logs:', error);
-    }
-  }, []);
-
-  const fetchSubdomains = useCallback(async (targetId: string) => {
-    try {
-      const { data } = await supabase.from('subdomains').select('*').eq('target_id', targetId).order('subdomain', { ascending: true });
-      setSubdomains(data as Subdomain[]);
-    } catch (error) {
-      console.error('Error fetching subdomains:', error);
-    }
-  }, []);
-
-  const fetchVulnerabilities = useCallback(async (targetId: string) => {
-    try {
-      const { data } = await supabase.from('vulnerabilities').select('*').eq('target_id', targetId);
-      setVulns(data as Vulnerability[]);
-    } catch (error) {
-      console.error('Error fetching vulnerabilities:', error);
-    }
-  }, []);
-
-  const subscribeToUpdates = (targetId: string) => {
+  const subscribeToUpdates = useCallback((targetId: string) => {
     const logsChannel = supabase
       .channel(`agent_logs:${targetId}`)
       .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'agent_logs', filter: `target_id=eq.${targetId}` }, (payload) => {
-        setLogs((prev) => [...prev, payload.new as Log]);
+        setLogs((prev) => {
+          if (prev.some((log) => log.id === payload.new.id)) return prev;
+          return [...prev, payload.new as Log];
+        });
       })
       .subscribe();
 
     const subdomainsChannel = supabase
       .channel(`subdomains:${targetId}`)
       .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'subdomains', filter: `target_id=eq.${targetId}` }, (payload) => {
-        setSubdomains((prev) => [...prev, payload.new as Subdomain]);
+        setSubdomains((prev) => {
+          if (prev.some((sub) => sub.id === payload.new.id)) return prev;
+          return [...prev, payload.new as Subdomain];
+        });
       })
       .subscribe();
 
     const vulnsChannel = supabase
       .channel(`vulns:${targetId}`)
       .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'vulnerabilities', filter: `target_id=eq.${targetId}` }, (payload) => {
-        setVulns((prev) => [...prev, payload.new as Vulnerability]);
+        setVulns((prev) => {
+          if (prev.some((v) => v.id === payload.new.id)) return prev;
+          return [...prev, payload.new as Vulnerability];
+        });
       })
       .subscribe();
 
@@ -392,10 +377,13 @@ export default function SecurityDashboard() {
       .channel(`targets:${targetId}`)
       .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'targets', filter: `id=eq.${targetId}` }, (payload) => {
         const updatedTarget = payload.new as Target;
-        if (updatedTarget.status === 'completed') {
-          setIsScanning(false);
-          fetchTargets();
-        }
+        setActiveTarget((current) => {
+          if (current?.id === updatedTarget.id) {
+            return updatedTarget;
+          }
+          return current;
+        });
+        fetchTargets();
       })
       .subscribe();
 
@@ -405,10 +393,15 @@ export default function SecurityDashboard() {
       supabase.removeChannel(vulnsChannel);
       supabase.removeChannel(targetsChannel);
     };
-  };
+  }, [fetchTargets]);
 
   const handleScan = async () => {
-    if (!domain.trim()) return;
+    if (!domain.trim() || isScanning) return;
+
+    setIsStartingScan(true);
+    setLogs([]);
+    setSubdomains([]);
+    setVulns([]);
 
     try {
       const response = await fetch('/api/scan', {
@@ -417,37 +410,70 @@ export default function SecurityDashboard() {
         body: JSON.stringify({ domain: domain.trim() }),
       });
 
+      if (!response.ok) {
+        throw new Error(`Failed to launch scan: ${response.statusText}`);
+      }
+
       const { target_id } = await response.json();
-      setIsScanning(true);
+
+      const newTarget = {
+        id: target_id,
+        domain: domain.trim(),
+        status: 'scanning',
+        created_at: new Date().toISOString()
+      };
+      setActiveTarget(newTarget);
+      setTargets((prev) => [newTarget, ...prev]);
+    } catch (error) {
+      console.error('Error starting scan:', error);
+    } finally {
+      setIsStartingScan(false);
+    }
+  };
+
+  const handleTargetSelect = (target: Target) => {
+    setActiveTarget(target);
+  };
+
+  useEffect(() => {
+    if (!activeTarget?.id) return;
+
+    let active = true;
+
+    const loadData = async () => {
       setLogs([]);
       setSubdomains([]);
       setVulns([]);
 
-      const newTarget = { id: target_id, domain: domain.trim(), status: 'scanning', created_at: new Date().toISOString() };
-      setActiveTarget(newTarget);
-      setTargets((prev) => [newTarget, ...prev]);
+      try {
+        const [initialLogs, initialSubdomains, initialVulns] = await Promise.all([
+          supabase.from('agent_logs').select('*').eq('target_id', activeTarget.id).order('timestamp', { ascending: true }),
+          supabase.from('subdomains').select('*').eq('target_id', activeTarget.id).order('subdomain', { ascending: true }),
+          supabase.from('vulnerabilities').select('*').eq('target_id', activeTarget.id)
+        ]);
 
-      const unsubscribe = subscribeToUpdates(target_id);
+        if (!active) return;
 
-      setTimeout(() => {
-        fetchLogs(target_id);
-        fetchSubdomains(target_id);
-        fetchVulnerabilities(target_id);
-      }, 1000);
+        if (initialLogs.data) setLogs(initialLogs.data as Log[]);
+        if (initialSubdomains.data) setSubdomains(initialSubdomains.data as Subdomain[]);
+        if (initialVulns.data) setVulns(initialVulns.data as Vulnerability[]);
+      } catch (err) {
+        console.error('Error loading initial target data:', err);
+      }
+    };
 
-      return () => unsubscribe();
-    } catch (error) {
-      console.error('Error starting scan:', error);
+    loadData();
+
+    let unsubscribe: (() => void) | undefined;
+    if (activeTarget.status === 'scanning') {
+      unsubscribe = subscribeToUpdates(activeTarget.id);
     }
-  };
 
-  const handleTargetSelect = async (target: Target) => {
-    setActiveTarget(target);
-    setLogs([]);
-    setSubdomains([]);
-    setVulns([]);
-    await Promise.all([fetchLogs(target.id), fetchSubdomains(target.id), fetchVulnerabilities(target.id)]);
-  };
+    return () => {
+      active = false;
+      if (unsubscribe) unsubscribe();
+    };
+  }, [activeTarget?.id, activeTarget?.status, subscribeToUpdates]);
 
   useEffect(() => {
     fetchTargets();
@@ -554,26 +580,23 @@ export default function SecurityDashboard() {
                       <button
                         key={target.id}
                         onClick={() => handleTargetSelect(target)}
-                        className={`w-full text-left px-3 py-2.5 rounded-xl transition-all ${
-                          isActive
+                        className={`w-full text-left px-3 py-2.5 rounded-xl transition-all ${isActive
                             ? 'bg-gradient-to-r from-cyan-500/20 to-violet-500/20 border border-cyan-500/40 text-cyan-300'
                             : 'text-slate-400 hover:bg-slate-800/50 border border-transparent hover:border-slate-700/50'
-                        }`}
+                          }`}
                       >
                         <div className="flex items-center gap-1.5 mb-1">
-                          <div className={`w-1.5 h-1.5 rounded-full shrink-0 ${
-                            isRunning ? 'bg-amber-400 animate-pulse' :
-                            isCompleted ? 'bg-emerald-400' :
-                            isFailed ? 'bg-rose-400' : 'bg-slate-500'
-                          }`} />
+                          <div className={`w-1.5 h-1.5 rounded-full shrink-0 ${isRunning ? 'bg-amber-400 animate-pulse' :
+                              isCompleted ? 'bg-emerald-400' :
+                                isFailed ? 'bg-rose-400' : 'bg-slate-500'
+                            }`} />
                           <span className="text-[11px] font-mono font-semibold truncate">{target.domain}</span>
                         </div>
                         <div className="flex items-center gap-1.5 pl-3">
-                          <span className={`text-[9px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded ${
-                            isRunning ? 'bg-amber-500/20 text-amber-400' :
-                            isCompleted ? 'bg-emerald-500/20 text-emerald-400' :
-                            isFailed ? 'bg-rose-500/20 text-rose-400' : 'bg-slate-700/50 text-slate-500'
-                          }`}>
+                          <span className={`text-[9px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded ${isRunning ? 'bg-amber-500/20 text-amber-400' :
+                              isCompleted ? 'bg-emerald-500/20 text-emerald-400' :
+                                isFailed ? 'bg-rose-500/20 text-rose-400' : 'bg-slate-700/50 text-slate-500'
+                            }`}>
                             {target.status}
                           </span>
                           <span className="text-[9px] text-slate-600 ml-auto">
@@ -589,8 +612,8 @@ export default function SecurityDashboard() {
 
             {/* Right Panel */}
             <div className="flex-1 overflow-hidden flex flex-col">
-          {activeTarget ? (
-              <div className="grid grid-cols-12 gap-4 flex-1 overflow-hidden p-6">
+              {activeTarget ? (
+                <div className="grid grid-cols-12 gap-4 flex-1 overflow-hidden p-6">
                   {/* Left - Threat Gauge & Logs */}
                   <div className="col-span-3 flex flex-col gap-4 min-h-0">
                     {/* Threat Gauge Card */}
@@ -741,22 +764,22 @@ export default function SecurityDashboard() {
                     </div>
                   </div>
                 </div>
-            ) : (
-              <div className="flex-1 flex items-center justify-center">
-                <div className="text-center">
-                  <div className="mb-6 flex justify-center">
-                    <div className="relative">
-                      <div className="absolute inset-0 bg-gradient-to-r from-cyan-500 to-violet-500 rounded-3xl blur-2xl opacity-30 animate-pulse" />
-                      <div className="relative p-4 bg-gradient-to-br from-slate-800 to-slate-900 rounded-3xl border border-slate-700">
-                        <Radar className="w-16 h-16 text-cyan-400 animate-pulse" style={{ animation: 'pulse-glow 2s ease-in-out infinite' }} />
+              ) : (
+                <div className="flex-1 flex items-center justify-center">
+                  <div className="text-center">
+                    <div className="mb-6 flex justify-center">
+                      <div className="relative">
+                        <div className="absolute inset-0 bg-gradient-to-r from-cyan-500 to-violet-500 rounded-3xl blur-2xl opacity-30 animate-pulse" />
+                        <div className="relative p-4 bg-gradient-to-br from-slate-800 to-slate-900 rounded-3xl border border-slate-700">
+                          <Radar className="w-16 h-16 text-cyan-400 animate-pulse" style={{ animation: 'pulse-glow 2s ease-in-out infinite' }} />
+                        </div>
                       </div>
                     </div>
+                    <h2 className="text-2xl font-bold text-slate-200 mb-2">Ready to scan</h2>
+                    <p className="text-slate-400 text-sm">Enter a domain above and launch a scan to discover vulnerabilities</p>
                   </div>
-                  <h2 className="text-2xl font-bold text-slate-200 mb-2">Ready to scan</h2>
-                  <p className="text-slate-400 text-sm">Enter a domain above and launch a scan to discover vulnerabilities</p>
                 </div>
-              </div>
-            )}
+              )}
             </div>
           </main>
 
@@ -810,18 +833,5 @@ export default function SecurityDashboard() {
 
 
     </>
-  );
-}
-
-// Add missing Share2 icon
-function Share2(props: any) {
-  return (
-    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" {...props}>
-      <circle cx="18" cy="5" r="3" />
-      <circle cx="6" cy="12" r="3" />
-      <circle cx="18" cy="19" r="3" />
-      <line x1="8.59" y1="13.51" x2="15.42" y2="17.49" />
-      <line x1="15.41" y1="6.51" x2="8.59" y2="10.49" />
-    </svg>
   );
 }
